@@ -8,7 +8,7 @@ from typing import Dict, Any
 # Screen settings
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
-TARGET_FPS = 60
+TARGET_FPS = 30
 
 # MediaPipe Landmark Indices
 WRIST = 0

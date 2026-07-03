@@ -11,6 +11,13 @@ import pyautogui
 from pynput.mouse import Controller, Button
 from typing import Tuple, Dict, Any
 
+try:
+    import win32api
+    import win32con
+except ImportError:
+    win32api = None
+    win32con = None
+
 from constants import (
     GESTURE_MOVE, GESTURE_LEFT_CLICK, GESTURE_RIGHT_CLICK, GESTURE_DRAG,
     GESTURE_SCROLL, GESTURE_SCREENSHOT, GESTURE_PAUSE, GESTURE_LOCK
@@ -132,6 +139,11 @@ class MouseController:
         self.is_dragging = False
         self.scroll_anchor_y = 0.0
         self.is_scrolling = False
+        self.prev_action_states = {
+            "left": False,
+            "right": False,
+            "drag": False,
+        }
         self.last_stats_update = time.time()
         
         # Session statistics (reset on app start)
@@ -222,13 +234,15 @@ class MouseController:
             self._release_drag_if_active()
             self.is_scrolling = False
             self._move_cursor(self.smooth_x, self.smooth_y)
-            self._trigger_left_click()
+            if not self.prev_action_states["left"]:
+                self._trigger_left_click()
             
         elif gesture == GESTURE_RIGHT_CLICK:
             self._release_drag_if_active()
             self.is_scrolling = False
             self._move_cursor(self.smooth_x, self.smooth_y)
-            self._trigger_right_click()
+            if not self.prev_action_states["right"]:
+                self._trigger_right_click()
             
         elif gesture == GESTURE_DRAG:
             self.is_scrolling = False
@@ -238,7 +252,10 @@ class MouseController:
             self._release_drag_if_active()
             # Use Index tip current vs anchor displacement to perform scrolling
             self._trigger_scroll(control_pt[1])
-            
+
+        self.prev_action_states["left"] = gesture == GESTURE_LEFT_CLICK
+        self.prev_action_states["right"] = gesture == GESTURE_RIGHT_CLICK
+        self.prev_action_states["drag"] = gesture == GESTURE_DRAG
         return int(self.smooth_x), int(self.smooth_y)
 
     def _map_to_screen(self, hx: float, hy: float) -> Tuple[float, float]:
@@ -327,7 +344,10 @@ class MouseController:
         self.stats["distance_moved"] += dist
         
         try:
-            pyautogui.moveTo(int(x), int(y), duration=0)
+            if win32api is not None:
+                win32api.SetCursorPos((int(x), int(y)))
+            else:
+                pyautogui.moveTo(int(x), int(y), duration=0)
         except Exception as e:
             logger.error("System Action failed: Move Cursor: %s", e)
             self.set_enabled(False)
@@ -337,7 +357,11 @@ class MouseController:
     def _trigger_left_click(self) -> None:
         """Performs left click action."""
         try:
-            pyautogui.click(button="left")
+            if win32api is not None and win32con is not None:
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            else:
+                pyautogui.click(button="left")
         except Exception as e:
             logger.error("System Action failed: Left Click: %s", e)
             self.set_enabled(False)
@@ -350,7 +374,11 @@ class MouseController:
     def _trigger_right_click(self) -> None:
         """Performs right click action."""
         try:
-            pyautogui.click(button="right")
+            if win32api is not None and win32con is not None:
+                win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+                win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+            else:
+                pyautogui.click(button="right")
         except Exception as e:
             logger.error("System Action failed: Right Click: %s", e)
             self.set_enabled(False)
@@ -368,7 +396,10 @@ class MouseController:
         """
         if not self.is_dragging:
             try:
-                pyautogui.mouseDown(button="left")
+                if win32api is not None and win32con is not None:
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                else:
+                    pyautogui.mouseDown(button="left")
             except Exception as e:
                 logger.error("System Action failed: Drag Hold: %s", e)
                 self.set_enabled(False)
@@ -382,7 +413,10 @@ class MouseController:
         """Releases the left click if currently dragging."""
         if self.is_dragging:
             try:
-                pyautogui.mouseUp(button="left")
+                if win32api is not None and win32con is not None:
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                else:
+                    pyautogui.mouseUp(button="left")
             except Exception as e:
                 logger.error("System Action failed: Drag Release: %s", e)
             self.is_dragging = False
@@ -403,13 +437,16 @@ class MouseController:
         scroll_speed = self.settings.get("scroll_speed")
         
         # Scroll threshold: must move finger beyond min threshold to scroll
-        scroll_threshold = 0.02
+        scroll_threshold = 0.01
         if abs(dy) > scroll_threshold:
             # Scale scroll steps
-            scroll_amount = int(np.sign(dy) * -3 * scroll_speed)
+            scroll_amount = int(np.sign(dy) * -5 * scroll_speed)
             if scroll_amount != 0:
                 try:
-                    pyautogui.scroll(scroll_amount)
+                    if win32api is not None and win32con is not None:
+                        win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, scroll_amount * 120, 0)
+                    else:
+                        pyautogui.scroll(scroll_amount)
                 except Exception as e:
                     logger.error("System Action failed: Scroll: %s", e)
                     self.set_enabled(False)

@@ -344,6 +344,13 @@ class SmartAirMouseApp(ctk.CTk):
         )
         self.reset_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(8, 0))
 
+        self.test_click_btn = ctk.CTkButton(
+            self.actions_bar, text="Test Click", fg_color="#444444", hover_color="#555555",
+            text_color="#FFFFFF", font=ctk.CTkFont(family="Segoe UI", size=12),
+            width=90, height=40, command=self._test_left_click
+        )
+        self.test_click_btn.pack(side=tk.LEFT, padx=(8, 0))
+
     # ==========================================
     # SETTINGS ELEMENT BUILDERS
     # ==========================================
@@ -598,6 +605,10 @@ class SmartAirMouseApp(ctk.CTk):
         self.total_frames = 0
         self.tracked_frames = 0
         logger.info("Session statistics reset.")
+
+    def _test_left_click(self) -> None:
+        """Runs a direct OS click test at the current cursor location."""
+        self.mouse_controller._trigger_left_click()
 
     def open_calibration(self) -> None:
         """Launches the calibration wizard modal."""

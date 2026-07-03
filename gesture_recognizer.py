@@ -90,6 +90,12 @@ class GestureRecognizer:
         
         dist_thumb_index = calculate_distance(thumb_tip_coords, index_tip_coords)
         dist_thumb_middle = calculate_distance(thumb_tip_coords, middle_tip_coords)
+        hand_scale = max(
+            calculate_distance(landmarks[WRIST], landmarks[MIDDLE_FINGER_MCP]),
+            0.001
+        )
+        adaptive_enter = max(self.pinch_enter_threshold, hand_scale * 0.22)
+        adaptive_exit = max(self.pinch_exit_threshold, hand_scale * 0.30)
 
         # 3. Classify raw gesture candidates
         raw_gesture = GESTURE_MOVE
@@ -106,15 +112,15 @@ class GestureRecognizer:
             confidence = 0.95
 
         # SCREENSHOT: Three fingers extended (Index, Middle, Ring), pinky folded
-        elif index_ext and middle_ext and ring_ext and not pinky_ext and not thumb_ext:
+        elif index_ext and middle_ext and ring_ext and not pinky_ext:
             raw_gesture = GESTURE_SCREENSHOT
             confidence = 0.90
 
         # SCROLL: Two fingers extended (Index, Middle), ring and pinky folded
         elif index_ext and middle_ext and not ring_ext and not pinky_ext:
             # Check pinch override
-            is_index_pinched = dist_thumb_index < self._get_pinch_threshold("drag", dist_thumb_index)
-            is_middle_pinched = dist_thumb_middle < self._get_pinch_threshold("drag", dist_thumb_middle)
+            is_index_pinched = dist_thumb_index < self._get_pinch_threshold("drag", adaptive_enter, adaptive_exit)
+            is_middle_pinched = dist_thumb_middle < self._get_pinch_threshold("drag", adaptive_enter, adaptive_exit)
             
             if is_index_pinched and is_middle_pinched:
                 raw_gesture = GESTURE_DRAG
@@ -126,8 +132,8 @@ class GestureRecognizer:
         # PINCH DETECTIONS: Left Click (Thumb + Index), Right Click (Thumb + Middle)
         else:
             # Determine threshold with hysteresis
-            idx_thresh = self._get_pinch_threshold("left", dist_thumb_index)
-            mid_thresh = self._get_pinch_threshold("right", dist_thumb_middle)
+            idx_thresh = self._get_pinch_threshold("left", adaptive_enter, adaptive_exit)
+            mid_thresh = self._get_pinch_threshold("right", adaptive_enter, adaptive_exit)
             
             is_index_pinched = dist_thumb_index < idx_thresh
             is_middle_pinched = dist_thumb_middle < mid_thresh
@@ -138,10 +144,10 @@ class GestureRecognizer:
             elif is_index_pinched:
                 raw_gesture = GESTURE_LEFT_CLICK
                 # Calculate simple inverse distance-based confidence score
-                confidence = max(0.5, 1.0 - (dist_thumb_index / self.pinch_exit_threshold))
+                confidence = max(0.5, 1.0 - (dist_thumb_index / adaptive_exit))
             elif is_middle_pinched:
                 raw_gesture = GESTURE_RIGHT_CLICK
-                confidence = max(0.5, 1.0 - (dist_thumb_middle / self.pinch_exit_threshold))
+                confidence = max(0.5, 1.0 - (dist_thumb_middle / adaptive_exit))
             elif index_ext:
                 raw_gesture = GESTURE_MOVE
                 confidence = 0.90
@@ -150,7 +156,18 @@ class GestureRecognizer:
                 confidence = 0.0
 
         # 4. Debounce and filter state transitions
-        stabilized_gesture = self._debounce_gesture(raw_gesture)
+        if raw_gesture in (
+            GESTURE_LEFT_CLICK,
+            GESTURE_RIGHT_CLICK,
+            GESTURE_DRAG,
+            GESTURE_SCROLL,
+            GESTURE_SCREENSHOT,
+        ):
+            stabilized_gesture = raw_gesture
+            self.current_gesture = raw_gesture
+            self.history.clear()
+        else:
+            stabilized_gesture = self._debounce_gesture(raw_gesture)
         
         # 5. Apply Cooldowns to transient actions (Screenshot, Click triggers)
         now = time.time()
@@ -179,20 +196,21 @@ class GestureRecognizer:
 
         return stabilized_gesture, confidence
 
-    def _get_pinch_threshold(self, name: str, current_dist: float) -> float:
+    def _get_pinch_threshold(self, name: str, enter_threshold: float, exit_threshold: float) -> float:
         """Implements hysteresis by checking current state to decide threshold.
 
         Args:
             name: ID of the state ("left", "right", or "drag").
-            current_dist: Calculated distance.
+            enter_threshold: Distance needed to enter pinch state.
+            exit_threshold: Distance needed to release pinch state.
 
         Returns:
             The threshold boundary.
         """
         # If already pinched, use the larger release threshold to prevent flicker
         if self.prev_pinch_states.get(name, False):
-            return self.pinch_exit_threshold
-        return self.pinch_enter_threshold
+            return exit_threshold
+        return enter_threshold
 
     def _debounce_gesture(self, new_raw_gesture: str) -> str:
         """Appends raw gesture to buffer and stabilizes rapid flickering.

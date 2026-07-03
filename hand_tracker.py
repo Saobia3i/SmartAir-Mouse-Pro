@@ -123,8 +123,9 @@ class HandTracker:
             logger.error("Failed to open camera index %d", self.camera_index)
             return False
             
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.start_time = time.time()
         self.frame_timestamp_ms = 0
@@ -173,10 +174,8 @@ class HandTracker:
         
         # Process detection. VIDEO mode keeps tracking state between frames and is much
         # faster for live webcam streams than independent IMAGE detections.
-        timestamp_ms = int((time.time() - self.start_time) * 1000)
-        if timestamp_ms <= self.frame_timestamp_ms:
-            timestamp_ms = self.frame_timestamp_ms + 1
-        self.frame_timestamp_ms = timestamp_ms
+        self.frame_timestamp_ms += 33
+        timestamp_ms = self.frame_timestamp_ms
         results = self.detector.detect_for_video(mp_image, timestamp_ms)
         hand_data: Optional[Dict[str, Any]] = None
 
