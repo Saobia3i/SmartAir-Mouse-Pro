@@ -19,6 +19,9 @@ except ImportError:
     win32con = None
 
 from constants import (
+    WRIST, THUMB_TIP, INDEX_FINGER_TIP, INDEX_FINGER_PIP,
+    MIDDLE_FINGER_TIP, MIDDLE_FINGER_PIP, MIDDLE_FINGER_MCP,
+    RING_FINGER_TIP, RING_FINGER_PIP, PINKY_TIP, PINKY_PIP,
     GESTURE_MOVE, GESTURE_LEFT_CLICK, GESTURE_RIGHT_CLICK, GESTURE_DRAG,
     GESTURE_SCROLL, GESTURE_SCREENSHOT, GESTURE_PAUSE, GESTURE_LOCK
 )
@@ -143,7 +146,11 @@ class MouseController:
             "left": False,
             "right": False,
             "drag": False,
+            "screenshot": False,
         }
+        self.one_finger_tap = self._new_tap_state()
+        self.two_finger_tap = self._new_tap_state()
+        self.last_one_finger_tap_time = 0.0
         self.last_stats_update = time.time()
         
         # Session statistics (reset on app start)
@@ -193,6 +200,132 @@ class MouseController:
         screen_x, screen_y = self._map_to_screen(control_pt[0], control_pt[1])
         self.smooth_x, self.smooth_y = self._apply_filters(screen_x, screen_y)
         return int(self.smooth_x), int(self.smooth_y)
+
+    def process_simple_hand_action(self, landmarks: list) -> Tuple[int, int, str]:
+        """Runs a simple, reliable gesture map directly from landmarks.
+
+        Rules:
+            Index tip controls cursor.
+            One-finger double tap triggers left click.
+            Two-finger tap triggers right click.
+            Two-finger hold and vertical movement scrolls.
+            Three fingers trigger screenshot.
+
+        Args:
+            landmarks: Raw normalized landmarks list.
+
+        Returns:
+            Cursor x, cursor y, and detected action name.
+        """
+        if not self.enabled:
+            x, y = self.preview_cursor_position(landmarks)
+            return x, y, "PREVIEW"
+
+        cursor_x, cursor_y = self.preview_cursor_position(landmarks)
+        self._move_cursor(self.smooth_x, self.smooth_y)
+
+        index_ext = landmarks[INDEX_FINGER_TIP][1] < landmarks[INDEX_FINGER_PIP][1]
+        middle_ext = landmarks[MIDDLE_FINGER_TIP][1] < landmarks[MIDDLE_FINGER_PIP][1]
+        ring_ext = landmarks[RING_FINGER_TIP][1] < landmarks[RING_FINGER_PIP][1]
+        pinky_ext = landmarks[PINKY_TIP][1] < landmarks[PINKY_PIP][1]
+
+        action = GESTURE_MOVE
+        now = time.time()
+        if index_ext and middle_ext and ring_ext and not pinky_ext:
+            action = GESTURE_SCREENSHOT
+            self._reset_tap_states()
+        elif index_ext and middle_ext and not ring_ext:
+            self.one_finger_tap = self._new_tap_state()
+            avg_y = (landmarks[INDEX_FINGER_TIP][1] + landmarks[MIDDLE_FINGER_TIP][1]) / 2.0
+            if self._detect_tap(self.two_finger_tap, avg_y, now):
+                action = GESTURE_RIGHT_CLICK
+            elif now - self.two_finger_tap["start_time"] > 0.35:
+                action = GESTURE_SCROLL
+        elif index_ext and not middle_ext:
+            self.two_finger_tap = self._new_tap_state()
+            if self._detect_tap(self.one_finger_tap, landmarks[INDEX_FINGER_TIP][1], now):
+                if now - self.last_one_finger_tap_time <= 0.75:
+                    action = GESTURE_LEFT_CLICK
+                    self.last_one_finger_tap_time = 0.0
+                else:
+                    action = "TAP 1/2"
+                    self.last_one_finger_tap_time = now
+        else:
+            self._reset_tap_states()
+
+        if action == GESTURE_LEFT_CLICK:
+            self._release_drag_if_active()
+            self.is_scrolling = False
+            if not self.prev_action_states["left"]:
+                self._trigger_left_click()
+        elif action == GESTURE_RIGHT_CLICK:
+            self._release_drag_if_active()
+            self.is_scrolling = False
+            if not self.prev_action_states["right"]:
+                self._trigger_right_click()
+        elif action == GESTURE_SCROLL:
+            self._release_drag_if_active()
+            scroll_y = (landmarks[INDEX_FINGER_TIP][1] + landmarks[MIDDLE_FINGER_TIP][1]) / 2.0
+            self._trigger_scroll(scroll_y)
+        else:
+            self._release_drag_if_active()
+            self.is_scrolling = False
+
+        self.prev_action_states["left"] = action == GESTURE_LEFT_CLICK
+        self.prev_action_states["right"] = action == GESTURE_RIGHT_CLICK
+        self.prev_action_states["drag"] = action == GESTURE_DRAG
+        self.prev_action_states["screenshot"] = action == GESTURE_SCREENSHOT
+        return cursor_x, cursor_y, action
+
+    @staticmethod
+    def _new_tap_state() -> Dict[str, Any]:
+        """Creates state used to detect an air tap."""
+        return {
+            "phase": "idle",
+            "anchor_y": None,
+            "start_time": time.time(),
+            "down_time": 0.0,
+        }
+
+    def _reset_tap_states(self) -> None:
+        """Resets tap gesture state when the hand pose changes."""
+        self.one_finger_tap = self._new_tap_state()
+        self.two_finger_tap = self._new_tap_state()
+
+    def _detect_tap(self, state: Dict[str, Any], y: float, now: float) -> bool:
+        """Detects a quick down-and-up air tap from finger y movement."""
+        down_delta = 0.035
+        up_delta = 0.018
+        max_tap_seconds = 0.45
+
+        if state["anchor_y"] is None:
+            state["anchor_y"] = y
+            state["start_time"] = now
+            return False
+
+        if now - state["start_time"] > 1.0:
+            state.update(self._new_tap_state())
+            state["anchor_y"] = y
+            return False
+
+        if state["phase"] == "idle":
+            state["anchor_y"] = min(state["anchor_y"], y)
+            if y - state["anchor_y"] > down_delta:
+                state["phase"] = "down"
+                state["down_time"] = now
+                return False
+
+        if state["phase"] == "down":
+            if now - state["down_time"] > max_tap_seconds:
+                state.update(self._new_tap_state())
+                state["anchor_y"] = y
+                return False
+            if y <= state["anchor_y"] + up_delta:
+                state.update(self._new_tap_state())
+                state["anchor_y"] = y
+                return True
+
+        return False
 
     def process_mouse_action(self, gesture: str, landmarks: list, width: int, height: int) -> Tuple[int, int]:
         """Main dispatcher translating gestures to screen events.
@@ -287,6 +420,14 @@ class MouseController:
         screen_y = mapped_y * self.screen_h
         
         return screen_x, screen_y
+
+    @staticmethod
+    def _distance(pt1: tuple, pt2: tuple) -> float:
+        """Calculates simple Euclidean distance between two normalized landmarks."""
+        dx = pt1[0] - pt2[0]
+        dy = pt1[1] - pt2[1]
+        dz = pt1[2] - pt2[2]
+        return float(np.sqrt(dx * dx + dy * dy + dz * dz))
 
     def _apply_filters(self, x: float, y: float) -> Tuple[float, float]:
         """Filters cursor tremors using Kalman predictions & exponential smoothing.

@@ -45,11 +45,11 @@ GESTURE_LOCK = "LOCK"
 GESTURE_NONE = "NONE"
 
 GESTURE_DESCRIPTIONS = {
-    GESTURE_MOVE: "Index finger: Move cursor",
-    GESTURE_LEFT_CLICK: "Thumb + Index pinch: Left Click",
-    GESTURE_RIGHT_CLICK: "Thumb + Middle pinch: Right Click",
+    GESTURE_MOVE: "One finger: Move cursor",
+    GESTURE_LEFT_CLICK: "One finger double tap: Left Click",
+    GESTURE_RIGHT_CLICK: "Two finger tap: Right Click",
     GESTURE_DRAG: "Index + Middle pinch: Drag",
-    GESTURE_SCROLL: "Two fingers vertical: Scroll",
+    GESTURE_SCROLL: "Two fingers up/down: Scroll",
     GESTURE_SCREENSHOT: "Three fingers: Screenshot",
     GESTURE_PAUSE: "Open Palm: Pause Tracking",
     GESTURE_LOCK: "Closed Fist: Lock Cursor",

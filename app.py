@@ -85,6 +85,7 @@ class SmartAirMouseApp(ctk.CTk):
         self.tracking_thread: Optional[threading.Thread] = None
         self.keyboard_listener: Optional[keyboard.Listener] = None
         self.session_start_time = 0.0
+        self.last_simple_screenshot_time = 0.0
         
         # Frame queues for thread-safe UI updates
         self.frame_queue: queue.Queue = queue.Queue(maxsize=2)
@@ -656,8 +657,7 @@ class SmartAirMouseApp(ctk.CTk):
                     hand_data = meta["hand"]
                     landmarks = hand_data["landmarks"]
                     
-                    # Recognize gesture
-                    gesture, confidence = self.recognizer.recognize(landmarks)
+                    gesture = "MOVE"
                     
                     # Pass data to wizard if wizard modal exists
                     if self.wizard and self.wizard.winfo_exists() and self.wizard.calibrating_data:
@@ -665,31 +665,20 @@ class SmartAirMouseApp(ctk.CTk):
                         state = "CALIBRATING"
                         self.effects.set_gesture_label("CALIBRATING")
                     else:
-                        # Normal operational mouse routing
-                        if gesture == "PAUSE":
-                            state = "PAUSED"
-                            self.effects.set_gesture_label("PAUSED")
-                        elif gesture == "LOCK":
-                            state = "LOCKED"
-                            self.effects.set_gesture_label("LOCKED")
+                        if self.mouse_control_enabled:
+                            cursor_x, cursor_y, gesture = self.mouse_controller.process_simple_hand_action(landmarks)
                         else:
-                            # Move / Click / Scroll / Drag
-                            if self.mouse_control_enabled:
-                                cursor_x, cursor_y = self.mouse_controller.process_mouse_action(
-                                    gesture, landmarks, meta["width"], meta["height"]
-                                )
-                            else:
-                                cursor_x, cursor_y = self.mouse_controller.preview_cursor_position(landmarks)
-                            
-                            # Set active text label next to neon halo
-                            self.effects.set_gesture_label(gesture.replace("_", " "))
-                            
-                            # Generate click sound and sparks on transitions
+                            cursor_x, cursor_y = self.mouse_controller.preview_cursor_position(landmarks)
+                            gesture = "PREVIEW"
+
+                        self.effects.set_gesture_label(gesture.replace("_", " "))
+
+                        if gesture in ("LEFT_CLICK", "RIGHT_CLICK", "DRAG"):
                             self._handle_gesture_sound_and_sparks(gesture, cursor_x, cursor_y)
-                            
-                            # Capture screenshots on 3-finger trigger
-                            if gesture == GESTURE_SCREENSHOT:
-                                self._trigger_screenshot()
+
+                        if gesture == GESTURE_SCREENSHOT and time.time() - self.last_simple_screenshot_time > 2.0:
+                            self.last_simple_screenshot_time = time.time()
+                            self._trigger_screenshot()
                 else:
                     self.effects.set_gesture_label("NO HAND")
 
