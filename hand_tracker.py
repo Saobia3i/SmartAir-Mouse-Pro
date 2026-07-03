@@ -1,36 +1,31 @@
-"""Hand tracking module using MediaPipe.
+"""Hand tracking module using MediaPipe Tasks API.
 
-Acquires camera frames, automatically detects active video inputs, runs hand landmarks detection,
-and processes statistics like tracker FPS, confidence, and handedness.
+Supports the modern MediaPipe HandLandmarker API. Automatically downloads the required
+model file, flips feeds, tracks landmarks, and computes frame rates.
 """
 
 import cv2
-import mediapipe as mp
 import time
 import logging
+import urllib.request
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-# Try standard solutions imports
-try:
-    from mediapipe.solutions import hands as mp_hands
-    from mediapipe.solutions import drawing_utils as mp_draw
-    from mediapipe.solutions import drawing_styles as mp_draw_styles
-except ImportError:
-    import mediapipe.python.solutions.hands as mp_hands
-    import mediapipe.python.solutions.drawing_utils as mp_draw
-    import mediapipe.python.solutions.drawing_styles as mp_draw_styles
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 logger = logging.getLogger(__name__)
 
 class HandTracker:
-    """Manages OpenCV Video Capture and MediaPipe Hand Tracking execution."""
+    """Manages OpenCV Video Capture and MediaPipe Tasks Hand Tracking execution."""
 
     def __init__(self,
                  camera_index: int = 0,
                  max_num_hands: int = 1,
                  detection_confidence: float = 0.75,
                  tracking_confidence: float = 0.75) -> None:
-        """Initializes the hand tracker and media resources.
+        """Initializes the hand landmarker tasks and model file.
 
         Args:
             camera_index: Index of camera to try first.
@@ -47,16 +42,45 @@ class HandTracker:
         self.prev_time = time.time()
         self.fps = 0.0
         
-        # Initialize MediaPipe Hands
-        self.mp_hands = mp_hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=self.max_num_hands,
-            min_detection_confidence=self.detection_confidence,
-            min_tracking_confidence=self.tracking_confidence
+        # Define model target path
+        self.assets_dir = Path("./assets").resolve()
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        self.model_path = self.assets_dir / "hand_landmarker.task"
+        
+        # Verify model download
+        self._ensure_model_downloaded()
+        
+        # Initialize MediaPipe Tasks Hand Landmarker
+        logger.info("Initializing MediaPipe HandLandmarker Task...")
+        base_options = python.BaseOptions(model_asset_path=str(self.model_path))
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=self.max_num_hands,
+            min_hand_detection_confidence=self.detection_confidence,
+            min_hand_presence_confidence=self.detection_confidence,
+            min_tracking_confidence=self.tracking_confidence,
+            running_mode=vision.RunningMode.IMAGE
         )
-        self.mp_draw = mp_draw
-        self.mp_draw_styles = mp_draw_styles
+        self.detector = vision.HandLandmarker.create_from_options(options)
+        logger.info("MediaPipe HandLandmarker Task initialized successfully.")
+
+    def _ensure_model_downloaded(self) -> None:
+        """Downloads the official Google MediaPipe hand landmarker task file if missing."""
+        if not self.model_path.exists():
+            url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            logger.info("Downloading hand landmarker task file from %s...", url)
+            try:
+                # Add headers to avoid HTTP blocks
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                )
+                with urllib.request.urlopen(req, timeout=30) as response, open(self.model_path, "wb") as out_file:
+                    out_file.write(response.read())
+                logger.info("Model download complete. Saved to %s", self.model_path)
+            except Exception as e:
+                logger.critical("Failed to download MediaPipe model file. App cannot start. Error: %s", e)
+                raise RuntimeError(f"Could not download hand_landmarker.task: {e}")
 
     def auto_select_camera(self) -> int:
         """Iterates over common camera indexes to find an active video input.
@@ -64,14 +88,11 @@ class HandTracker:
         Returns:
             The index of the selected working camera, or -1 if none found.
         """
-        # Try index 0 up to 3
         test_indices = [self.camera_index, 0, 1, 2]
-        # Remove duplicates while keeping order
         test_indices = list(dict.fromkeys(test_indices))
         
         for index in test_indices:
             logger.info("Testing camera interface at index %d...", index)
-            # On Windows, cv2.CAP_DSHOW is generally faster to initialize and avoids logs
             cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
             if cap.isOpened():
                 ret, frame = cap.read()
@@ -92,7 +113,6 @@ class HandTracker:
         """
         self.stop_camera()
         
-        # Verify and select working index
         active_index = self.auto_select_camera()
         self.camera_index = active_index
         
@@ -101,10 +121,8 @@ class HandTracker:
             logger.error("Failed to open camera index %d", self.camera_index)
             return False
             
-        # Optimize camera settings for 720p 60FPS if supported
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        # Enable buffer optimization
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -125,12 +143,11 @@ class HandTracker:
         elapsed = current_time - self.prev_time
         if elapsed > 0:
             current_fps = 1.0 / elapsed
-            # Simple running average to smooth the FPS display
             self.fps = self.fps * 0.9 + current_fps * 0.1
         self.prev_time = current_time
 
-    def process_frame(self) -> Tuple[Optional[np_image_raw := Any], Dict[str, Any]]:
-        """Reads a frame, flips it, runs MediaPipe, and extracts tracking data.
+    def process_frame(self) -> Tuple[Optional[Any], Dict[str, Any]]:
+        """Reads a frame, flips it, runs MediaPipe Tasks, and extracts landmarks.
 
         Returns:
             A tuple of (processed_cv2_frame, tracking_metadata_dict).
@@ -142,39 +159,34 @@ class HandTracker:
         if not ret or frame is None:
             return None, {"active": False, "reason": "No frame read"}
 
-        # Calculate tracker execution FPS
         self.update_fps()
-
-        # Flip the frame horizontally for mirror-view cursor navigation
         frame = cv2.flip(frame, 1)
         height, width, _ = frame.shape
 
-        # MediaPipe requires RGB format, avoid unnecessary copies where possible
+        # Tasks API takes MediaPipe Image object format
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_frame.flags.writeable = False  # Performance optimization: pass by reference
-        results = self.hands.process(rgb_frame)
-        rgb_frame.flags.writeable = True
-
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        
+        # Process detection
+        results = self.detector.detect(mp_image)
         hand_data: Optional[Dict[str, Any]] = None
 
-        if results.multi_hand_landmarks and results.multi_handedness:
-            # We process the first detected hand for cursor control
-            landmarks = results.multi_hand_landmarks[0]
-            handedness = results.multi_handedness[0].classification[0]
+        if results.hand_landmarks and results.handedness:
+            landmarks = results.hand_landmarks[0]
+            handedness = results.handedness[0][0]
             
-            label = handedness.label  # "Left" or "Right"
-            score = handedness.score  # Confidence score
+            label = handedness.category_name
+            score = handedness.score
 
             landmark_list: List[Tuple[float, float, float]] = []
-            for lm in landmarks.landmark:
-                # Store normalized coordinates
+            for lm in landmarks:
                 landmark_list.append((lm.x, lm.y, lm.z))
 
             hand_data = {
                 "landmarks": landmark_list,
                 "handedness": label,
                 "confidence": score,
-                "raw_landmarks": landmarks,  # Original MediaPipe landmarks object
+                "raw_landmarks": landmarks,  # List of NormalizedLandmark objects
                 "bounding_box": self._get_bounding_box(landmark_list, width, height)
             }
 
@@ -189,10 +201,10 @@ class HandTracker:
         return frame, metadata
 
     def _get_bounding_box(self, landmarks: List[Tuple[float, float, float]], width: int, height: int) -> Tuple[int, int, int, int]:
-        """Calculates pixel-space bounding box enclosing all hand landmarks.
+        """Calculates bounding box around hand landmarks.
 
         Args:
-            landmarks: Normalized hand landmarks.
+            landmarks: Normalized landmarks list.
             width: Image width.
             height: Image height.
 
@@ -207,7 +219,6 @@ class HandTracker:
         ymin = int(min(y_coords) * height)
         ymax = int(max(y_coords) * height)
         
-        # Add a light padding margin around the bounding box
         padding = 15
         xmin = max(0, xmin - padding)
         ymin = max(0, ymin - padding)
@@ -217,26 +228,46 @@ class HandTracker:
         return xmin, ymin, xmax, ymax
 
     def draw_landmarks(self, frame: Any, hand_metadata: Dict[str, Any]) -> None:
-        """Draws skeleton lines and landmark points on the frame.
+        """Draws skeleton lines manually using OpenCV (eliminates drawing_utils dependencies).
 
         Args:
-            frame: OpenCV image frame.
-            hand_metadata: Dictionary containing landmark details.
+            frame: OpenCV frame.
+            hand_metadata: Dict containing hand statistics.
         """
-        if not hand_metadata or "raw_landmarks" not in hand_metadata:
+        if not hand_metadata or "landmarks" not in hand_metadata:
             return
         
-        raw_lm = hand_metadata["raw_landmarks"]
-        self.mp_draw.draw_landmarks(
-            frame,
-            raw_lm,
-            self.mp_hands.HAND_CONNECTIONS,
-            self.mp_draw_styles.get_default_hand_landmarks_style(),
-            self.mp_draw_styles.get_default_hand_connections_style()
-        )
+        landmarks = hand_metadata["landmarks"]
+        h, w, _ = frame.shape
+        
+        connections = [
+            # Thumb
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            # Index
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            # Middle
+            (9, 10), (10, 11), (11, 12),
+            # Ring
+            (13, 14), (14, 15), (15, 16),
+            # Pinky
+            (0, 17), (17, 18), (18, 19), (19, 20),
+            # Palm Knuckles
+            (5, 9), (9, 13), (13, 17)
+        ]
+        
+        # Draw skeleton lines
+        for start, end in connections:
+            p1 = (int(landmarks[start][0] * w), int(landmarks[start][1] * h))
+            p2 = (int(landmarks[end][0] * w), int(landmarks[end][1] * h))
+            cv2.line(frame, p1, p2, (57, 255, 20), 2)  # Neon Green
+            
+        # Draw joint nodes
+        for pt in landmarks:
+            p = (int(pt[0] * w), int(pt[1] * h))
+            cv2.circle(frame, p, 4, (0, 240, 255), -1)  # Cyan
 
     def close(self) -> None:
-        """Releases camera and media resources."""
+        """Releases detector and camera resources."""
         self.stop_camera()
-        self.hands.close()
+        self.detector.close()
         logger.info("HandTracker engine shutdown complete.")

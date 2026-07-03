@@ -18,9 +18,9 @@ from constants import (
 
 logger = logging.getLogger(__name__)
 
-# Deactivate pyautogui safety delay to maximize cursor tracking performance
+# Keep pyautogui's corner failsafe available as a last-resort escape hatch.
 pyautogui.PAUSE = 0.0
-pyautogui.FAILSAFE = False
+pyautogui.FAILSAFE = True
 
 
 class KalmanFilter2D:
@@ -117,6 +117,7 @@ class MouseController:
         """
         self.settings = settings
         self.mouse = Controller()
+        self.enabled = True
         
         # Primary cursor screen size details
         self.screen_w, self.screen_h = pyautogui.size()
@@ -152,6 +153,35 @@ class MouseController:
             "accuracy": 0.98
         }
 
+    def set_enabled(self, enabled: bool) -> None:
+        """Enables or disables physical OS pointer injection.
+
+        Args:
+            enabled: If False, movement, clicks, drags, and scrolls are ignored.
+        """
+        self.enabled = enabled
+        if not enabled:
+            self._release_drag_if_active()
+
+    def emergency_stop(self) -> None:
+        """Immediately disables pointer injection and releases any held button."""
+        self.set_enabled(False)
+        logger.warning("Emergency stop activated. Mouse injection disabled.")
+
+    def preview_cursor_position(self, landmarks: list) -> Tuple[int, int]:
+        """Updates the smoothed virtual cursor position without OS injection.
+
+        Args:
+            landmarks: Raw normalized landmarks list.
+
+        Returns:
+            The virtual cursor coordinate (x, y).
+        """
+        control_pt = landmarks[8]
+        screen_x, screen_y = self._map_to_screen(control_pt[0], control_pt[1])
+        self.smooth_x, self.smooth_y = self._apply_filters(screen_x, screen_y)
+        return int(self.smooth_x), int(self.smooth_y)
+
     def process_mouse_action(self, gesture: str, landmarks: list, width: int, height: int) -> Tuple[int, int]:
         """Main dispatcher translating gestures to screen events.
 
@@ -164,6 +194,9 @@ class MouseController:
         Returns:
             The final smoothed screen coordinate (x, y) of the cursor.
         """
+        if not self.enabled:
+            return int(self.smooth_x), int(self.smooth_y)
+
         if gesture == GESTURE_LOCK:
             # Cursor is locked, do not update movement or register actions
             return int(self.smooth_x), int(self.smooth_y)

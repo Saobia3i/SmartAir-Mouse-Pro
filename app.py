@@ -10,18 +10,20 @@ import time
 import queue
 import logging
 import threading
+import tkinter as tk
 from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from PIL import Image, ImageTk
 import cv2
 import pyautogui
 import customtkinter as ctk
+from pynput import keyboard
 
 # Add workspace directory to sys.path to allow execution from any folder
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from constants import (
-    DEFAULT_SETTINGS, GESTURE_SCREENSHOT, GESTURE_NONE,
+    DEFAULT_SETTINGS, TARGET_FPS, GESTURE_SCREENSHOT, GESTURE_NONE,
     COLOR_BG_DARK, COLOR_SIDEBAR_DARK, GESTURE_DESCRIPTIONS
 )
 from config import ConfigManager
@@ -69,6 +71,7 @@ class SmartAirMouseApp(ctk.CTk):
             click_threshold=self.settings.get("click_threshold")
         )
         self.mouse_controller = MouseController(self.settings)
+        self.mouse_control_enabled = False
         self.effects = CursorEffects()
         
         # 2. UI Windows & Threading states
@@ -78,6 +81,7 @@ class SmartAirMouseApp(ctk.CTk):
         self.is_running = True
         self.is_tracking = False
         self.tracking_thread: Optional[threading.Thread] = None
+        self.keyboard_listener: Optional[keyboard.Listener] = None
         self.session_start_time = 0.0
         
         # Frame queues for thread-safe UI updates
@@ -90,6 +94,7 @@ class SmartAirMouseApp(ctk.CTk):
         
         # Register close handler
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
+        self.bind("<Escape>", lambda _event: self.emergency_stop())
         
         # 3. Build UI Layout
         self.configure(fg_color=COLOR_BG_DARK)
@@ -103,6 +108,20 @@ class SmartAirMouseApp(ctk.CTk):
         
         # Start GUI polling timer loop (updates camera preview and statistics)
         self._poll_ui_queues()
+        self._start_keyboard_listener()
+
+    def _start_keyboard_listener(self) -> None:
+        """Starts a global keyboard listener for the emergency stop shortcut."""
+        if self.keyboard_listener is not None:
+            return
+
+        def _on_press(key: keyboard.Key) -> None:
+            if key == keyboard.Key.esc:
+                self.after(0, self.emergency_stop)
+
+        self.keyboard_listener = keyboard.Listener(on_press=_on_press)
+        self.keyboard_listener.daemon = True
+        self.keyboard_listener.start()
 
     def _build_layout(self) -> None:
         """Draws the sidebar, statistics panels, and camera view frames."""
@@ -188,6 +207,14 @@ class SmartAirMouseApp(ctk.CTk):
             command=self._on_hud_skeleton_toggled
         )
         self.hud_skeleton_switch.pack(pady=10, anchor=tk.W, padx=15)
+
+        self.mouse_control_switch = ctk.CTkSwitch(
+            self.scroll_frame,
+            text="Mouse Control",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            command=self._on_mouse_control_toggled
+        )
+        self.mouse_control_switch.pack(pady=10, anchor=tk.W, padx=15)
         
         # ==========================================
         # RIGHT PANEL: STATS, PREVIEW & BUTTONS
@@ -415,11 +442,18 @@ class SmartAirMouseApp(ctk.CTk):
         if self.overlay:
             self.overlay.hand_skeleton_visible = enabled
 
+    def _on_mouse_control_toggled(self) -> None:
+        enabled = self.mouse_control_switch.get() == 1
+        self.mouse_control_enabled = enabled
+        self.mouse_controller.set_enabled(enabled and self.is_tracking)
+        logger.info("Mouse control injection %s.", "enabled" if enabled else "disabled")
+
     def _load_ui_values(self) -> None:
         """Sets toggle switches based on configurations loaded at startup."""
         self.sound_switch.select() if self.settings.get("sound_enabled") else self.sound_switch.deselect()
         self.particle_switch.select() if self.settings.get("particles_enabled") else self.particle_switch.deselect()
         self.hud_skeleton_switch.select()
+        self.mouse_control_switch.deselect()
 
     # ==========================================
     # CORE SYSTEM CONTROLS
@@ -430,6 +464,7 @@ class SmartAirMouseApp(ctk.CTk):
             return
             
         logger.info("Initializing hand tracking processor...")
+        self.mouse_controller.set_enabled(self.mouse_control_enabled)
         # Instanciate tracker with selected camera index
         self.tracker.camera_index = self.settings.get("camera_index")
         
@@ -444,7 +479,6 @@ class SmartAirMouseApp(ctk.CTk):
         self.start_btn.configure(state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
         self.calibrate_btn.configure(state=tk.DISABLED)
-        self.sidebar.configure(state=tk.DISABLED) # Prevent mid-run camera changes
         
         # Flush effects queue
         self.effects.clear()
@@ -471,6 +505,7 @@ class SmartAirMouseApp(ctk.CTk):
             self.tracking_thread = None
             
         self.tracker.stop_camera()
+        self.mouse_controller.set_enabled(False)
         
         # Reset buttons states
         self.start_btn.configure(state=tk.NORMAL)
@@ -484,6 +519,27 @@ class SmartAirMouseApp(ctk.CTk):
             self.overlay.hide()
             
         logger.info("Hand tracking processor stopped.")
+
+    def emergency_stop(self) -> None:
+        """Immediately stops tracking and disables OS mouse injection."""
+        logger.warning("Emergency stop requested. Stopping tracking and disabling mouse injection.")
+        self.mouse_controller.emergency_stop()
+        self.mouse_control_enabled = False
+        self.mouse_control_switch.deselect()
+        self.is_tracking = False
+
+        if self.tracking_thread is not None:
+            self.tracking_thread.join(timeout=0.5)
+            self.tracking_thread = None
+
+        self.tracker.stop_camera()
+        self.start_btn.configure(state=tk.NORMAL)
+        self.stop_btn.configure(state=tk.DISABLED)
+        self.calibrate_btn.configure(state=tk.NORMAL)
+        self.video_label.configure(text="EMERGENCY STOPPED\nPress Start Tracking to resume", image="")
+
+        if self.overlay:
+            self.overlay.hide()
 
     def reset_statistics(self) -> None:
         """Resets click counts, distance trackers, and timers."""
@@ -556,9 +612,12 @@ class SmartAirMouseApp(ctk.CTk):
                         self.effects.set_gesture_label("LOCKED")
                     else:
                         # Move / Click / Scroll / Drag
-                        cursor_x, cursor_y = self.mouse_controller.process_mouse_action(
-                            gesture, landmarks, meta["width"], meta["height"]
-                        )
+                        if self.mouse_control_enabled:
+                            cursor_x, cursor_y = self.mouse_controller.process_mouse_action(
+                                gesture, landmarks, meta["width"], meta["height"]
+                            )
+                        else:
+                            cursor_x, cursor_y = self.mouse_controller.preview_cursor_position(landmarks)
                         
                         # Set active text label next to neon halo
                         self.effects.set_gesture_label(gesture.replace("_", " "))
@@ -715,6 +774,9 @@ class SmartAirMouseApp(ctk.CTk):
         
         # Stop tracking
         self.stop_tracking()
+        if self.keyboard_listener is not None:
+            self.keyboard_listener.stop()
+            self.keyboard_listener = None
         
         # Close tracker resources
         self.tracker.close()

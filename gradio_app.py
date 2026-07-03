@@ -1,16 +1,21 @@
 """Gradio Web Application for SmartAir Mouse Pro.
 
-Runs a browser-based demo showcasing real-time camera capture, MediaPipe tracking,
+Runs a browser-based demo showcasing real-time camera capture, MediaPipe Tasks tracking,
 gesture classification overlays, and confidence metrics directly in the web browser.
 """
 
 import os
 import sys
 import cv2
+import urllib.request
 import numpy as np
-import mediapipe as mp
 import gradio as gr
+from pathlib import Path
 from typing import Tuple, Dict, Any
+
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 # Ensure workspace paths resolved
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,16 +23,34 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from constants import GESTURE_DESCRIPTIONS
 from gesture_recognizer import GestureRecognizer
 
-# Initialize MediaPipe Hands processor
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
+# Ensure model downloaded
+assets_dir = Path("./assets").resolve()
+assets_dir.mkdir(parents=True, exist_ok=True)
+model_path = assets_dir / "hand_landmarker.task"
+
+if not model_path.exists():
+    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as response, open(model_path, "wb") as out_file:
+            out_file.write(response.read())
+    except Exception as e:
+        raise RuntimeError(f"Could not download hand_landmarker.task: {e}")
+
+# Initialize MediaPipe Tasks Hand Landmarker
+base_options = python.BaseOptions(model_asset_path=str(model_path))
+options = vision.HandLandmarkerOptions(
+    base_options=base_options,
+    num_hands=1,
+    min_hand_detection_confidence=0.7,
+    min_hand_presence_confidence=0.7,
+    min_tracking_confidence=0.7,
+    running_mode=vision.RunningMode.IMAGE
 )
-mp_draw = mp.solutions.drawing_utils
-mp_draw_styles = mp.solutions.drawing_styles
+detector = vision.HandLandmarker.create_from_options(options)
 
 # Initialize Gesture Recognizer (using a standard default click threshold of 0.045)
 recognizer = GestureRecognizer(click_threshold=0.045)
@@ -50,29 +73,51 @@ def process_webcam_frame(frame: np.ndarray) -> Tuple[np.ndarray, str, float]:
     height, width, _ = frame.shape
 
     # MediaPipe process (Gradio input frames are already in RGB format)
-    results = hands.process(frame)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+    results = detector.detect(mp_image)
 
     gesture_name = "NONE"
     confidence = 0.0
 
-    if results.multi_hand_landmarks and results.multi_handedness:
-        landmarks = results.multi_hand_landmarks[0]
-        handedness = results.multi_handedness[0].classification[0]
+    if results.hand_landmarks and results.handedness:
+        landmarks = results.hand_landmarks[0]
+        handedness = results.handedness[0][0]
+        
+        label = handedness.category_name
+        score = handedness.score
         
         # Extract normalized coordinates
-        landmark_list = [(lm.x, lm.y, lm.z) for lm in landmarks.landmark]
+        landmark_list = [(lm.x, lm.y, lm.z) for lm in landmarks]
         
         # Recognize gesture
         gesture_name, confidence = recognizer.recognize(landmark_list)
         
-        # Draw skeleton connections
-        mp_draw.draw_landmarks(
-            frame,
-            landmarks,
-            mp_hands.HAND_CONNECTIONS,
-            mp_draw_styles.get_default_hand_landmarks_style(),
-            mp_draw_styles.get_default_hand_connections_style()
-        )
+        # Draw skeleton connections manually using OpenCV
+        connections = [
+            # Thumb
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            # Index
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            # Middle
+            (9, 10), (10, 11), (11, 12),
+            # Ring
+            (13, 14), (14, 15), (15, 16),
+            # Pinky
+            (0, 17), (17, 18), (18, 19), (19, 20),
+            # Palm Knuckles
+            (5, 9), (9, 13), (13, 17)
+        ]
+        
+        # Draw skeleton lines
+        for start, end in connections:
+            p1 = (int(landmark_list[start][0] * width), int(landmark_list[start][1] * height))
+            p2 = (int(landmark_list[end][0] * width), int(landmark_list[end][1] * height))
+            cv2.line(frame, p1, p2, (57, 255, 20), 2)  # Neon Green
+            
+        # Draw joints
+        for pt in landmark_list:
+            p = (int(pt[0] * width), int(pt[1] * height))
+            cv2.circle(frame, p, 4, (0, 240, 255), -1)  # Cyan
         
         # Compute bounding box
         x_coords = [lm[0] for lm in landmark_list]
@@ -90,7 +135,7 @@ def process_webcam_frame(frame: np.ndarray) -> Tuple[np.ndarray, str, float]:
         ymax = min(height, ymax + padding)
         
         # Draw Bounding Box (Red for right hand, Blue for left hand)
-        box_color = (0, 102, 255) if handedness.label == "Left" else (57, 255, 20)  # BGR
+        box_color = (0, 102, 255) if label == "Left" else (57, 255, 20)  # BGR
         cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), box_color, 2)
         
         # Draw Gesture Label on frame
@@ -108,7 +153,7 @@ def process_webcam_frame(frame: np.ndarray) -> Tuple[np.ndarray, str, float]:
         # Print Hand Info
         cv2.putText(
             frame,
-            f"Hand: {handedness.label}",
+            f"Hand: {label}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -136,12 +181,12 @@ theme = gr.themes.Soft(
     block_label_text_color="#AAAAAA"
 )
 
-with gr.Blocks(theme=theme, title="SmartAir Mouse Pro - Web Sandbox") as demo:
+with gr.Blocks(title="SmartAir Mouse Pro - Web Sandbox") as demo:
     gr.Markdown(
         """
         # 🖐️ SmartAir Mouse Pro - Web Demo
         This sandbox demonstrates the core computer vision algorithms of the **SmartAir Mouse Pro** system.
-        It runs MediaPipe hand tracking and matches posture joints against our spatial gesture classifier in real-time.
+        It runs MediaPipe Tasks hand tracking and matches posture joints against our spatial gesture classifier in real-time.
         """
     )
     
@@ -153,6 +198,11 @@ with gr.Blocks(theme=theme, title="SmartAir Mouse Pro - Web Sandbox") as demo:
                 type="numpy",
                 label="Active Web Camera Stream",
                 streaming=True
+            )
+            annotated_output = gr.Image(
+                type="numpy",
+                label="Tracked Hand Preview",
+                interactive=False
             )
             
         with gr.Column(scale=2):
@@ -183,7 +233,7 @@ with gr.Blocks(theme=theme, title="SmartAir Mouse Pro - Web Sandbox") as demo:
     webcam_input.stream(
         fn=process_webcam_frame,
         inputs=[webcam_input],
-        outputs=[webcam_input, gesture_output, confidence_output],
+        outputs=[annotated_output, gesture_output, confidence_output],
         queue=True
     )
     
@@ -195,5 +245,4 @@ with gr.Blocks(theme=theme, title="SmartAir Mouse Pro - Web Sandbox") as demo:
     )
 
 if __name__ == "__main__":
-    logger_init = gr.logging.get_logger(__name__)
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    demo.launch(server_name="127.0.0.1", theme=theme)
