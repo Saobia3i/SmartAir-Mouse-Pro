@@ -80,6 +80,8 @@ class SmartAirMouseApp(ctk.CTk):
         
         self.is_running = True
         self.is_tracking = False
+        self.is_starting = False
+        self.startup_thread: Optional[threading.Thread] = None
         self.tracking_thread: Optional[threading.Thread] = None
         self.keyboard_listener: Optional[keyboard.Listener] = None
         self.session_start_time = 0.0
@@ -102,6 +104,7 @@ class SmartAirMouseApp(ctk.CTk):
         
         # Initialize Overlay Window
         self.overlay = OverlayWindow(self, self.settings, self.effects)
+        self.overlay.hide()
         
         # Auto-update slider displays from loaded settings
         self._load_ui_values()
@@ -212,7 +215,7 @@ class SmartAirMouseApp(ctk.CTk):
             self.scroll_frame,
             text="Mouse Control",
             font=ctk.CTkFont(family="Segoe UI", size=12),
-            command=self._on_mouse_control_toggled
+            command=lambda: self._set_mouse_control(self.mouse_control_switch.get() == 1)
         )
         self.mouse_control_switch.pack(pady=10, anchor=tk.W, padx=15)
         
@@ -302,6 +305,14 @@ class SmartAirMouseApp(ctk.CTk):
         # 3. Action Control Buttons (Bottom Panel)
         self.actions_bar = ctk.CTkFrame(self.main_container, fg_color="transparent")
         self.actions_bar.grid(row=3, column=0, sticky="ew")
+
+        self.mouse_control_main_switch = ctk.CTkSwitch(
+            self.actions_bar,
+            text="Mouse Control: OFF",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            command=lambda: self._set_mouse_control(self.mouse_control_main_switch.get() == 1)
+        )
+        self.mouse_control_main_switch.pack(side=tk.LEFT, padx=(0, 12))
         
         self.start_btn = ctk.CTkButton(
             self.actions_bar, text="Start Tracking", fg_color="#228B22", hover_color="#1E7B1E",
@@ -359,6 +370,8 @@ class SmartAirMouseApp(ctk.CTk):
             if is_int:
                 value = int(round(value))
             self.settings.set(key, value, auto_save=False)
+            if key == "sensitivity_x":
+                self.settings.set("sensitivity_y", value, auto_save=False)
             v_lbl.configure(text=val_format % value)
             
             # Hot reload thresholds/trail parameters
@@ -442,10 +455,17 @@ class SmartAirMouseApp(ctk.CTk):
         if self.overlay:
             self.overlay.hand_skeleton_visible = enabled
 
-    def _on_mouse_control_toggled(self) -> None:
-        enabled = self.mouse_control_switch.get() == 1
+    def _set_mouse_control(self, enabled: bool) -> None:
+        """Toggles real OS mouse control while keeping preview mode available."""
         self.mouse_control_enabled = enabled
         self.mouse_controller.set_enabled(enabled and self.is_tracking)
+        if enabled:
+            self.mouse_control_switch.select()
+            self.mouse_control_main_switch.select()
+        else:
+            self.mouse_control_switch.deselect()
+            self.mouse_control_main_switch.deselect()
+        self.mouse_control_main_switch.configure(text=f"Mouse Control: {'ON' if enabled else 'OFF'}")
         logger.info("Mouse control injection %s.", "enabled" if enabled else "disabled")
 
     def _load_ui_values(self) -> None:
@@ -453,30 +473,56 @@ class SmartAirMouseApp(ctk.CTk):
         self.sound_switch.select() if self.settings.get("sound_enabled") else self.sound_switch.deselect()
         self.particle_switch.select() if self.settings.get("particles_enabled") else self.particle_switch.deselect()
         self.hud_skeleton_switch.select()
-        self.mouse_control_switch.deselect()
+        self._set_mouse_control(False)
 
     # ==========================================
     # CORE SYSTEM CONTROLS
     # ==========================================
     def start_tracking(self) -> None:
         """Starts background tracking loops."""
-        if self.is_tracking:
+        if self.is_tracking or self.is_starting:
             return
             
         logger.info("Initializing hand tracking processor...")
+        self.is_starting = True
         self.mouse_controller.set_enabled(self.mouse_control_enabled)
-        # Instanciate tracker with selected camera index
+        self.video_label.configure(text="STARTING CAMERA...\nPlease wait", image="")
+        self.start_btn.configure(text="Starting...", state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.NORMAL)
+        self.calibrate_btn.configure(state=tk.DISABLED)
+
+        self.startup_thread = threading.Thread(target=self._start_tracking_worker, daemon=True)
+        self.startup_thread.start()
+
+    def _start_tracking_worker(self) -> None:
+        """Opens the camera outside the UI thread, then reports the result."""
         self.tracker.camera_index = self.settings.get("camera_index")
-        
-        if not self.tracker.start_camera():
+        started = self.tracker.start_camera()
+        self.after(0, lambda: self._on_camera_start_result(started))
+
+    def _on_camera_start_result(self, started: bool) -> None:
+        """Completes tracking startup on the UI thread after camera initialization."""
+        if not self.is_starting:
+            if started:
+                self.tracker.stop_camera()
+            return
+
+        self.is_starting = False
+        self.startup_thread = None
+
+        if not started:
             logger.error("Could not start tracking stream. Interface index issues.")
             self.video_label.configure(text="CAMERA CAPTURE ERROR\nPlease select a different camera source index.")
+            self.start_btn.configure(text="Start Tracking", state=tk.NORMAL)
+            self.stop_btn.configure(state=tk.DISABLED)
+            self.calibrate_btn.configure(state=tk.NORMAL)
+            self.mouse_controller.set_enabled(False)
             return
 
         self.is_tracking = True
         self.session_start_time = time.time()
         
-        self.start_btn.configure(state=tk.DISABLED)
+        self.start_btn.configure(text="Start Tracking", state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
         self.calibrate_btn.configure(state=tk.DISABLED)
         
@@ -494,10 +540,11 @@ class SmartAirMouseApp(ctk.CTk):
 
     def stop_tracking(self) -> None:
         """Halts background threads and releases video feeds."""
-        if not self.is_tracking:
+        if not self.is_tracking and not self.is_starting:
             return
             
         logger.info("Stopping hand tracking processor...")
+        self.is_starting = False
         self.is_tracking = False
         
         if self.tracking_thread is not None:
@@ -508,7 +555,7 @@ class SmartAirMouseApp(ctk.CTk):
         self.mouse_controller.set_enabled(False)
         
         # Reset buttons states
-        self.start_btn.configure(state=tk.NORMAL)
+        self.start_btn.configure(text="Start Tracking", state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
         self.calibrate_btn.configure(state=tk.NORMAL)
         
@@ -524,8 +571,8 @@ class SmartAirMouseApp(ctk.CTk):
         """Immediately stops tracking and disables OS mouse injection."""
         logger.warning("Emergency stop requested. Stopping tracking and disabling mouse injection.")
         self.mouse_controller.emergency_stop()
-        self.mouse_control_enabled = False
-        self.mouse_control_switch.deselect()
+        self._set_mouse_control(False)
+        self.is_starting = False
         self.is_tracking = False
 
         if self.tracking_thread is not None:
@@ -533,7 +580,7 @@ class SmartAirMouseApp(ctk.CTk):
             self.tracking_thread = None
 
         self.tracker.stop_camera()
-        self.start_btn.configure(state=tk.NORMAL)
+        self.start_btn.configure(text="Start Tracking", state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
         self.calibrate_btn.configure(state=tk.NORMAL)
         self.video_label.configure(text="EMERGENCY STOPPED\nPress Start Tracking to resume", image="")
@@ -574,71 +621,71 @@ class SmartAirMouseApp(ctk.CTk):
         target_delay = 1.0 / TARGET_FPS
         
         while self.is_tracking and self.is_running:
-            start_tick = time.time()
-            
-            frame, meta = self.tracker.process_frame()
-            if frame is None:
-                time.sleep(0.01)
-                continue
-
-            self.total_frames += 1
-            has_hand = meta.get("hand") is not None
-            if has_hand:
-                self.tracked_frames += 1
-
-            # Dispatch gestures
-            state = "ACTIVE"
-            cursor_x, cursor_y = int(self.mouse_controller.smooth_x), int(self.mouse_controller.smooth_y)
-            
-            if has_hand:
-                hand_data = meta["hand"]
-                landmarks = hand_data["landmarks"]
-                
-                # Recognize gesture
-                gesture, confidence = self.recognizer.recognize(landmarks)
-                
-                # Pass data to wizard if wizard modal exists
-                if self.wizard and self.wizard.winfo_exists() and self.wizard.calibrating_data:
-                    self.wizard.process_frame_data(meta)
-                    state = "CALIBRATING"
-                    self.effects.set_gesture_label("CALIBRATING")
-                else:
-                    # Normal operational mouse routing
-                    if gesture == "PAUSE":
-                        state = "PAUSED"
-                        self.effects.set_gesture_label("PAUSED")
-                    elif gesture == "LOCK":
-                        state = "LOCKED"
-                        self.effects.set_gesture_label("LOCKED")
-                    else:
-                        # Move / Click / Scroll / Drag
-                        if self.mouse_control_enabled:
-                            cursor_x, cursor_y = self.mouse_controller.process_mouse_action(
-                                gesture, landmarks, meta["width"], meta["height"]
-                            )
-                        else:
-                            cursor_x, cursor_y = self.mouse_controller.preview_cursor_position(landmarks)
-                        
-                        # Set active text label next to neon halo
-                        self.effects.set_gesture_label(gesture.replace("_", " "))
-                        
-                        # Generate click sound and sparks on transitions
-                        self._handle_gesture_sound_and_sparks(gesture, cursor_x, cursor_y)
-                        
-                        # Capture screenshots on 3-finger trigger
-                        if gesture == GESTURE_SCREENSHOT:
-                            self._trigger_screenshot()
-            else:
-                self.effects.set_gesture_label("NONE")
-
-            # Update overlay statistical FPS
-            self.effects.set_fps(meta.get("fps", 0.0))
-            
-            # Record trail point
-            self.effects.add_trail_point(cursor_x, cursor_y, self.settings.get("trail_length"))
-
-            # Queue frame and metadata for main thread GUI update safely
             try:
+                start_tick = time.time()
+                
+                frame, meta = self.tracker.process_frame()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                self.total_frames += 1
+                has_hand = meta.get("hand") is not None
+                if has_hand:
+                    self.tracked_frames += 1
+
+                # Dispatch gestures
+                state = "ACTIVE"
+                cursor_x, cursor_y = int(self.mouse_controller.smooth_x), int(self.mouse_controller.smooth_y)
+                
+                if has_hand:
+                    hand_data = meta["hand"]
+                    landmarks = hand_data["landmarks"]
+                    
+                    # Recognize gesture
+                    gesture, confidence = self.recognizer.recognize(landmarks)
+                    
+                    # Pass data to wizard if wizard modal exists
+                    if self.wizard and self.wizard.winfo_exists() and self.wizard.calibrating_data:
+                        self.wizard.process_frame_data(meta)
+                        state = "CALIBRATING"
+                        self.effects.set_gesture_label("CALIBRATING")
+                    else:
+                        # Normal operational mouse routing
+                        if gesture == "PAUSE":
+                            state = "PAUSED"
+                            self.effects.set_gesture_label("PAUSED")
+                        elif gesture == "LOCK":
+                            state = "LOCKED"
+                            self.effects.set_gesture_label("LOCKED")
+                        else:
+                            # Move / Click / Scroll / Drag
+                            if self.mouse_control_enabled:
+                                cursor_x, cursor_y = self.mouse_controller.process_mouse_action(
+                                    gesture, landmarks, meta["width"], meta["height"]
+                                )
+                            else:
+                                cursor_x, cursor_y = self.mouse_controller.preview_cursor_position(landmarks)
+                            
+                            # Set active text label next to neon halo
+                            self.effects.set_gesture_label(gesture.replace("_", " "))
+                            
+                            # Generate click sound and sparks on transitions
+                            self._handle_gesture_sound_and_sparks(gesture, cursor_x, cursor_y)
+                            
+                            # Capture screenshots on 3-finger trigger
+                            if gesture == GESTURE_SCREENSHOT:
+                                self._trigger_screenshot()
+                else:
+                    self.effects.set_gesture_label("NO HAND")
+
+                # Update overlay statistical FPS
+                self.effects.set_fps(meta.get("fps", 0.0))
+                
+                # Record trail point
+                self.effects.add_trail_point(cursor_x, cursor_y, self.settings.get("trail_length"))
+
+                # Queue frame and metadata for main thread GUI update safely
                 # Discard oldest frame if queue full to prevent delays
                 if self.frame_queue.full():
                     self.frame_queue.get_nowait()
@@ -647,17 +694,19 @@ class SmartAirMouseApp(ctk.CTk):
                     
                 self.frame_queue.put_nowait(frame)
                 self.meta_queue.put_nowait((cursor_x, cursor_y, meta, state))
-            except Exception:
-                pass
 
-            # Maintain frame loop timing
-            elapsed = time.time() - start_tick
-            sleep_time = max(0.002, target_delay - elapsed)
-            time.sleep(sleep_time)
+                # Maintain frame loop timing
+                elapsed = time.time() - start_tick
+                sleep_time = max(0.002, target_delay - elapsed)
+                time.sleep(sleep_time)
+            except Exception as e:
+                logger.exception("Tracking loop failed: %s", e)
+                self.effects.set_gesture_label("ERROR")
+                time.sleep(0.2)
 
     def _handle_gesture_sound_and_sparks(self, gesture: str, cx: int, cy: int) -> None:
         """Triggers audio playback and overlays click ripple particles on click gestures."""
-        prev = self.mouse_controller.prev_pinch_states
+        prev = self.recognizer.prev_pinch_states
         particles = self.settings.get("particles_enabled")
         
         # Left Click transition check
@@ -716,7 +765,7 @@ class SmartAirMouseApp(ctk.CTk):
                 rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
                 
                 img_pil = Image.fromarray(rgb_small)
-                img_tk = ImageTk.PhotoImage(image=img_pil)
+                img_tk = ctk.CTkImage(light_image=img_pil, dark_image=img_pil, size=(target_w, target_h))
                 
                 self.video_label.configure(text="", image=img_tk)
                 self.video_label.image = img_tk  # Keep reference to prevent GC

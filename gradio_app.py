@@ -181,6 +181,69 @@ theme = gr.themes.Soft(
     block_label_text_color="#AAAAAA"
 )
 
+APP_CSS = """
+.gradio-container {
+    background: #121212 !important;
+    color: #ffffff !important;
+    max-width: 1180px !important;
+}
+.app-shell {
+    gap: 0 !important;
+}
+.app-sidebar {
+    background: #1E1E1E;
+    border-right: 1px solid #2D2D2D;
+    min-height: 720px;
+    padding: 16px 10px;
+}
+.app-main {
+    padding: 16px 20px;
+}
+.app-title {
+    color: #ffffff;
+    font: 700 22px/1.2 Segoe UI, sans-serif;
+    letter-spacing: 0;
+    margin: 0 0 14px;
+}
+.sidebar-title {
+    color: #00FFCC;
+    font: 700 16px/1.2 Segoe UI, sans-serif;
+    text-align: center;
+    margin: 2px 0 18px;
+}
+.stat-card {
+    background: #1E1E1E;
+    border: 1px solid #2B2B2B;
+    border-radius: 6px;
+    padding: 12px;
+}
+.stat-label {
+    color: #888888;
+    font: 700 10px/1.2 Segoe UI, sans-serif;
+    text-transform: uppercase;
+}
+.stat-value {
+    color: #00FFCC;
+    font: 700 18px/1.3 Segoe UI, sans-serif;
+    margin-top: 4px;
+}
+.camera-panel {
+    background: #000000;
+    border: 1px solid #222222;
+    border-radius: 6px;
+    padding: 10px;
+}
+.guide-table {
+    background: #121212;
+    border-radius: 6px;
+}
+.compact-note {
+    color: #AAAAAA;
+    font-size: 12px;
+    margin-top: 12px;
+}
+"""
+
 with gr.Blocks(title="SmartAir Mouse Pro - Web Sandbox") as demo:
     gr.Markdown(
         """
@@ -190,30 +253,33 @@ with gr.Blocks(title="SmartAir Mouse Pro - Web Sandbox") as demo:
         """
     )
     
-    with gr.Row():
-        with gr.Column(scale=3):
+    with gr.Row(elem_classes=["app-shell"]):
+        with gr.Column(scale=3, elem_classes=["app-main"]):
             # Input webcam node
+            gr.HTML("<h1 class='app-title'>SMARTAIR MOUSE PRO</h1>")
             webcam_input = gr.Image(
                 sources=["webcam"],
                 type="numpy",
-                label="Active Web Camera Stream",
+                label="Camera Source",
                 streaming=True
             )
-            annotated_output = gr.Image(
-                type="numpy",
-                label="Tracked Hand Preview",
-                interactive=False
-            )
+            with gr.Column(elem_classes=["camera-panel"]):
+                annotated_output = gr.Image(
+                    type="numpy",
+                    label="Tracked Hand Preview",
+                    interactive=False
+                )
             
-        with gr.Column(scale=2):
+        with gr.Column(scale=2, elem_classes=["app-sidebar"]):
+            gr.HTML("<div class='sidebar-title'>SETTINGS PANEL</div>")
             # Text metrics
             gesture_output = gr.Textbox(
-                label="Recognized Gesture State",
+                label="Gesture",
                 value="NONE",
                 interactive=False
             )
             confidence_output = gr.Number(
-                label="Classification Confidence",
+                label="Confidence",
                 value=0.0,
                 interactive=False
             )
@@ -221,12 +287,13 @@ with gr.Blocks(title="SmartAir Mouse Pro - Web Sandbox") as demo:
             # Instructions table
             gr.Markdown("### 📜 Gesture Control Cheat Sheet")
             
-            guide_data = [[name, desc] for name, desc in GESTURE_DESCRIPTIONS.items()]
+            guide_data = [[name.replace("_", " "), desc] for name, desc in GESTURE_DESCRIPTIONS.items()]
             gr.DataFrame(
-                headers=["Gesture", "Action Triggered"],
+                headers=["Gesture", "Action"],
                 value=guide_data,
                 interactive=False,
-                wrap=True
+                wrap=True,
+                elem_classes=["guide-table"]
             )
 
     # Register frame process event hook
@@ -245,4 +312,4 @@ with gr.Blocks(title="SmartAir Mouse Pro - Web Sandbox") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", theme=theme)
+    demo.launch(server_name="127.0.0.1", theme=theme, css=APP_CSS)

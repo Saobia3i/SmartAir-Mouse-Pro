@@ -41,6 +41,8 @@ class HandTracker:
         self.cap: Optional[cv2.VideoCapture] = None
         self.prev_time = time.time()
         self.fps = 0.0
+        self.start_time = time.time()
+        self.frame_timestamp_ms = 0
         
         # Define model target path
         self.assets_dir = Path("./assets").resolve()
@@ -59,7 +61,7 @@ class HandTracker:
             min_hand_detection_confidence=self.detection_confidence,
             min_hand_presence_confidence=self.detection_confidence,
             min_tracking_confidence=self.tracking_confidence,
-            running_mode=vision.RunningMode.IMAGE
+            running_mode=vision.RunningMode.VIDEO
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
         logger.info("MediaPipe HandLandmarker Task initialized successfully.")
@@ -124,6 +126,8 @@ class HandTracker:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.start_time = time.time()
+        self.frame_timestamp_ms = 0
         
         actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
@@ -167,8 +171,13 @@ class HandTracker:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         
-        # Process detection
-        results = self.detector.detect(mp_image)
+        # Process detection. VIDEO mode keeps tracking state between frames and is much
+        # faster for live webcam streams than independent IMAGE detections.
+        timestamp_ms = int((time.time() - self.start_time) * 1000)
+        if timestamp_ms <= self.frame_timestamp_ms:
+            timestamp_ms = self.frame_timestamp_ms + 1
+        self.frame_timestamp_ms = timestamp_ms
+        results = self.detector.detect_for_video(mp_image, timestamp_ms)
         hand_data: Optional[Dict[str, Any]] = None
 
         if results.hand_landmarks and results.handedness:
@@ -189,6 +198,7 @@ class HandTracker:
                 "raw_landmarks": landmarks,  # List of NormalizedLandmark objects
                 "bounding_box": self._get_bounding_box(landmark_list, width, height)
             }
+            self.draw_landmarks(frame, hand_data)
 
         metadata = {
             "active": True,
