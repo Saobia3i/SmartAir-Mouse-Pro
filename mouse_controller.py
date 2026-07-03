@@ -326,22 +326,37 @@ class MouseController:
         dist = np.sqrt(dx * dx + dy * dy)
         self.stats["distance_moved"] += dist
         
-        self.mouse.position = (int(x), int(y))
+        try:
+            pyautogui.moveTo(int(x), int(y), duration=0)
+        except Exception as e:
+            logger.error("System Action failed: Move Cursor: %s", e)
+            self.set_enabled(False)
+            return
         self.last_x, self.last_y = x, y
 
     def _trigger_left_click(self) -> None:
         """Performs left click action."""
-        self.mouse.click(Button.left)
+        try:
+            pyautogui.click(button="left")
+        except Exception as e:
+            logger.error("System Action failed: Left Click: %s", e)
+            self.set_enabled(False)
+            return
         self.stats["clicks"] += 1
-        logger.debug("System Action: Left Click")
+        logger.info("System Action: Left Click")
         # Throttle click events to prevent multi-firing
         time.sleep(0.05)
 
     def _trigger_right_click(self) -> None:
         """Performs right click action."""
-        self.mouse.click(Button.right)
+        try:
+            pyautogui.click(button="right")
+        except Exception as e:
+            logger.error("System Action failed: Right Click: %s", e)
+            self.set_enabled(False)
+            return
         self.stats["right_clicks"] += 1
-        logger.debug("System Action: Right Click")
+        logger.info("System Action: Right Click")
         time.sleep(0.05)
 
     def _trigger_drag(self, x: float, y: float) -> None:
@@ -352,18 +367,26 @@ class MouseController:
             y: Destination Y.
         """
         if not self.is_dragging:
-            self.mouse.press(Button.left)
+            try:
+                pyautogui.mouseDown(button="left")
+            except Exception as e:
+                logger.error("System Action failed: Drag Hold: %s", e)
+                self.set_enabled(False)
+                return
             self.is_dragging = True
-            logger.debug("System Action: Drag Hold Started")
+            logger.info("System Action: Drag Hold Started")
             
         self._move_cursor(x, y)
 
     def _release_drag_if_active(self) -> None:
         """Releases the left click if currently dragging."""
         if self.is_dragging:
-            self.mouse.release(Button.left)
+            try:
+                pyautogui.mouseUp(button="left")
+            except Exception as e:
+                logger.error("System Action failed: Drag Release: %s", e)
             self.is_dragging = False
-            logger.debug("System Action: Drag Released")
+            logger.info("System Action: Drag Released")
 
     def _trigger_scroll(self, curr_y: float) -> None:
         """Calculates vertical displacement and scrolls.
@@ -385,7 +408,12 @@ class MouseController:
             # Scale scroll steps
             scroll_amount = int(np.sign(dy) * -3 * scroll_speed)
             if scroll_amount != 0:
-                self.mouse.scroll(0, scroll_amount)
+                try:
+                    pyautogui.scroll(scroll_amount)
+                except Exception as e:
+                    logger.error("System Action failed: Scroll: %s", e)
+                    self.set_enabled(False)
+                    return
                 self.stats["scroll_count"] += abs(scroll_amount)
                 # Reset anchor to track relative changes incrementally
                 self.scroll_anchor_y = curr_y

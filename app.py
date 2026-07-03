@@ -121,6 +121,8 @@ class SmartAirMouseApp(ctk.CTk):
         def _on_press(key: keyboard.Key) -> None:
             if key == keyboard.Key.esc:
                 self.after(0, self.emergency_stop)
+            elif key == keyboard.Key.f8:
+                self.after(0, lambda: self._set_mouse_control(not self.mouse_control_enabled))
 
         self.keyboard_listener = keyboard.Listener(on_press=_on_press)
         self.keyboard_listener.daemon = True
@@ -521,6 +523,7 @@ class SmartAirMouseApp(ctk.CTk):
 
         self.is_tracking = True
         self.session_start_time = time.time()
+        self._set_mouse_control(True)
         
         self.start_btn.configure(text="Start Tracking", state=tk.DISABLED)
         self.stop_btn.configure(state=tk.NORMAL)
