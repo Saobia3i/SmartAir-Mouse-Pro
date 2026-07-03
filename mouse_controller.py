@@ -21,7 +21,7 @@ except ImportError:
     win32con = None
 
 from constants import (
-    WRIST, THUMB_TIP, INDEX_FINGER_TIP, INDEX_FINGER_PIP,
+    WRIST, THUMB_TIP, INDEX_FINGER_MCP, INDEX_FINGER_TIP, INDEX_FINGER_PIP,
     MIDDLE_FINGER_TIP, MIDDLE_FINGER_PIP, MIDDLE_FINGER_MCP,
     RING_FINGER_TIP, RING_FINGER_PIP, PINKY_TIP, PINKY_PIP,
     GESTURE_MOVE, GESTURE_LEFT_CLICK, GESTURE_RIGHT_CLICK, GESTURE_DRAG,
@@ -206,6 +206,11 @@ class MouseController:
         self.left_pinch_start_time = 0.0
         self.left_drag_started = False
         self.right_click_fired = False
+        self.filtered_touch_pt = None
+        self.last_left_click_time = 0.0
+        self.last_right_click_time = 0.0
+        self.cursor_vel_x = 0.0
+        self.cursor_vel_y = 0.0
         
         # Session statistics (reset on app start)
         self.stats = {
@@ -271,6 +276,9 @@ class MouseController:
         self.right_pinched = False
         self.left_drag_started = False
         self.right_click_fired = False
+        self.filtered_touch_pt = None
+        self.cursor_vel_x = 0.0
+        self.cursor_vel_y = 0.0
         self._reset_tap_states()
         self._release_drag_if_active()
 
@@ -281,8 +289,8 @@ class MouseController:
             One index finger moves the cursor relative to its previous position.
             Thumb + index quick pinch/release performs left click.
             Thumb + index hold performs drag until released.
-            Thumb + middle pinch performs right click.
-            Two fingers move vertically to scroll while the cursor stays put.
+            Index + middle quick tap performs right click.
+            Index + middle vertical movement scrolls while the cursor stays put.
 
         Args:
             landmarks: Raw normalized landmarks list.
@@ -297,7 +305,7 @@ class MouseController:
         now = time.time()
         index_tip = landmarks[INDEX_FINGER_TIP]
         middle_tip = landmarks[MIDDLE_FINGER_TIP]
-        control_pt = (index_tip[0], index_tip[1])
+        control_pt = self._stable_control_point(landmarks)
 
         index_ext = landmarks[INDEX_FINGER_TIP][1] < landmarks[INDEX_FINGER_PIP][1]
         middle_ext = landmarks[MIDDLE_FINGER_TIP][1] < landmarks[MIDDLE_FINGER_PIP][1]
@@ -308,104 +316,223 @@ class MouseController:
             self._distance(landmarks[WRIST], landmarks[MIDDLE_FINGER_MCP]),
             0.001
         )
-        pinch_threshold = max(float(self.settings.get("click_threshold")), hand_scale * 0.28)
-        left_pinched = self._distance(landmarks[THUMB_TIP], landmarks[INDEX_FINGER_TIP]) < pinch_threshold
-        right_pinched = self._distance(landmarks[THUMB_TIP], landmarks[MIDDLE_FINGER_TIP]) < pinch_threshold
-        two_finger_scroll = index_ext and middle_ext and not ring_ext and not pinky_ext and not left_pinched and not right_pinched
+        base_threshold = max(float(self.settings.get("click_threshold")), hand_scale * 0.26)
+        release_threshold = base_threshold * 1.35
+        thumb_index_distance = self._distance(landmarks[THUMB_TIP], landmarks[INDEX_FINGER_TIP])
+        if self.left_pinched:
+            left_pinched = thumb_index_distance < release_threshold
+        else:
+            left_pinched = thumb_index_distance < base_threshold
+        two_finger_pose = index_ext and middle_ext and not ring_ext and not pinky_ext and not left_pinched
 
         action = GESTURE_MOVE
         if index_ext and middle_ext and ring_ext and not pinky_ext:
             self.last_touch_pt = control_pt
             self.last_scroll_y = None
+            self.is_scrolling = False
             return int(self.smooth_x), int(self.smooth_y), GESTURE_SCREENSHOT
 
-        if two_finger_scroll:
+        if two_finger_pose:
             avg_y = (index_tip[1] + middle_tip[1]) / 2.0
+            self.last_touch_pt = control_pt
+            self._finish_left_pinch(now, force_drag_release=True)
+
+            if (
+                not self.is_scrolling
+                and self._detect_tap(self.two_finger_tap, avg_y, now)
+                and now - self.last_right_click_time > 0.45
+            ):
+                self.last_scroll_y = None
+                self._trigger_right_click()
+                self.last_right_click_time = now
+                return int(self.smooth_x), int(self.smooth_y), GESTURE_RIGHT_CLICK
+
             if self.last_scroll_y is None:
                 self.last_scroll_y = avg_y
             else:
                 dy = avg_y - self.last_scroll_y
-                if abs(dy) > 0.006:
+                anchor_y = self.two_finger_tap.get("anchor_y")
+                anchor_delta = 0.0 if anchor_y is None else avg_y - anchor_y
+                wants_scroll = (
+                    self.is_scrolling
+                    or now - self.two_finger_tap["start_time"] > 0.18
+                    or abs(anchor_delta) > 0.025
+                )
+                if wants_scroll and abs(dy) > 0.006:
                     scroll_speed = float(self.settings.get("scroll_speed"))
                     scroll_amount = int(np.clip(-dy * 900.0 * scroll_speed, -10, 10))
                     if scroll_amount != 0:
+                        self.is_scrolling = True
                         self._send_scroll_steps(scroll_amount)
                         self.last_scroll_y = avg_y
-                action = GESTURE_SCROLL
-            self.last_touch_pt = control_pt
-            self._finish_left_pinch(now, force_drag_release=True)
-            self._finish_right_pinch()
+                elif wants_scroll:
+                    edge_scroll = self._edge_scroll_steps(avg_y)
+                    if edge_scroll != 0:
+                        self.is_scrolling = True
+                        self._send_scroll_steps(edge_scroll)
+            action = GESTURE_SCROLL if self.is_scrolling else GESTURE_MOVE
             return int(self.smooth_x), int(self.smooth_y), action
 
         self.last_scroll_y = None
-        self._move_touchpad_cursor(control_pt)
+        self.is_scrolling = False
+        self.two_finger_tap = self._new_tap_state()
 
-        if right_pinched and not self.right_pinched:
-            self.right_pinched = True
-            self.right_click_fired = True
-            self._finish_left_pinch(now, force_drag_release=True)
-            self._trigger_right_click()
-            action = GESTURE_RIGHT_CLICK
-        elif not right_pinched and self.right_pinched:
-            self._finish_right_pinch()
-
-        if left_pinched and not self.left_pinched and not right_pinched:
+        if left_pinched and not self.left_pinched:
             self.left_pinched = True
             self.left_pinch_start_time = now
             self.left_drag_started = False
+            self.last_touch_pt = control_pt
+            self.filtered_touch_pt = control_pt
+            if now - self.last_left_click_time > 0.20:
+                self._press_left_button()
             action = GESTURE_LEFT_CLICK
-        elif left_pinched and self.left_pinched and not right_pinched:
+        elif left_pinched and self.left_pinched:
             if not self.left_drag_started and now - self.left_pinch_start_time > 0.35:
                 self.left_drag_started = True
-                self._trigger_drag(self.smooth_x, self.smooth_y)
+                self.is_dragging = True
+                logger.info("System Action: Drag Hold Started")
             elif self.left_drag_started:
-                self._trigger_drag(self.smooth_x, self.smooth_y)
+                self._move_touchpad_cursor(control_pt, drag_mode=True)
+            else:
+                self.last_touch_pt = control_pt
+                self.filtered_touch_pt = control_pt
             action = GESTURE_DRAG if self.left_drag_started else GESTURE_LEFT_CLICK
         elif not left_pinched and self.left_pinched:
             action = self._finish_left_pinch(now)
+            self.last_touch_pt = control_pt
+            self.filtered_touch_pt = control_pt
+        else:
+            self._move_touchpad_cursor(control_pt)
 
         return int(self.smooth_x), int(self.smooth_y), action
 
-    def _move_touchpad_cursor(self, control_pt: Tuple[float, float]) -> None:
+    def _stable_control_point(self, landmarks: list) -> Tuple[float, float]:
+        """Returns a stable hand point for cursor movement."""
+        index_mcp = landmarks[INDEX_FINGER_MCP]
+        middle_mcp = landmarks[MIDDLE_FINGER_MCP]
+        index_tip = landmarks[INDEX_FINGER_TIP]
+        x = (index_mcp[0] * 0.30) + (middle_mcp[0] * 0.20) + (index_tip[0] * 0.50)
+        y = (index_mcp[1] * 0.30) + (middle_mcp[1] * 0.20) + (index_tip[1] * 0.50)
+        return float(x), float(y)
+
+    def _move_touchpad_cursor(self, control_pt: Tuple[float, float], drag_mode: bool = False) -> None:
         """Moves the cursor using relative finger deltas like a laptop touchpad."""
         if self.last_touch_pt is None:
             self.last_touch_pt = control_pt
+            self.filtered_touch_pt = control_pt
             return
 
-        dx_norm = control_pt[0] - self.last_touch_pt[0]
-        dy_norm = control_pt[1] - self.last_touch_pt[1]
-        self.last_touch_pt = control_pt
+        filter_alpha = 0.58 if drag_mode else 0.48
+        if self.filtered_touch_pt is None:
+            self.filtered_touch_pt = control_pt
+        filtered_pt = (
+            self.filtered_touch_pt[0] + (control_pt[0] - self.filtered_touch_pt[0]) * filter_alpha,
+            self.filtered_touch_pt[1] + (control_pt[1] - self.filtered_touch_pt[1]) * filter_alpha,
+        )
 
-        dead_zone = 0.0025
+        dx_norm = filtered_pt[0] - self.last_touch_pt[0]
+        dy_norm = filtered_pt[1] - self.last_touch_pt[1]
+        self.last_touch_pt = filtered_pt
+        self.filtered_touch_pt = filtered_pt
+
+        dead_zone = 0.0022 if not drag_mode else 0.0018
+        edge_x, edge_y = self._edge_push(filtered_pt)
+        dx_norm += edge_x
+        dy_norm += edge_y
         if abs(dx_norm) < dead_zone and abs(dy_norm) < dead_zone:
+            self.cursor_vel_x *= 0.65
+            self.cursor_vel_y *= 0.65
             return
 
-        sensitivity_x = float(self.settings.get("sensitivity_x")) * 0.32
-        sensitivity_y = float(self.settings.get("sensitivity_y")) * 0.32
-        dx = float(np.clip(dx_norm * self.screen_w * sensitivity_x, -32.0, 32.0))
-        dy = float(np.clip(dy_norm * self.screen_h * sensitivity_y, -32.0, 32.0))
+        speed = np.sqrt(dx_norm * dx_norm + dy_norm * dy_norm)
+        acceleration = 1.0 + min(max(speed - 0.006, 0.0) * 42.0, 2.2)
+        sensitivity_x = float(self.settings.get("sensitivity_x")) * 2.15
+        sensitivity_y = float(self.settings.get("sensitivity_y")) * 3.35
+        target_dx = float(np.clip(dx_norm * self.screen_w * sensitivity_x * acceleration, -185.0, 185.0))
+        target_dy = float(np.clip(dy_norm * self.screen_h * sensitivity_y * acceleration, -220.0, 220.0))
+        velocity_alpha = 0.70 if drag_mode else 0.55
+        self.cursor_vel_x = (self.cursor_vel_x * (1.0 - velocity_alpha)) + (target_dx * velocity_alpha)
+        self.cursor_vel_y = (self.cursor_vel_y * (1.0 - velocity_alpha)) + (target_dy * velocity_alpha)
 
-        next_x = float(np.clip(self.smooth_x + dx, 0.0, self.screen_w - 1.0))
-        next_y = float(np.clip(self.smooth_y + dy, 0.0, self.screen_h - 1.0))
-        alpha = max(0.25, min(float(self.settings.get("smoothing_factor")) + 0.25, 0.65))
+        next_x = float(np.clip(self.smooth_x + self.cursor_vel_x, 0.0, self.screen_w - 1.0))
+        next_y = float(np.clip(self.smooth_y + self.cursor_vel_y, 0.0, self.screen_h - 1.0))
+        alpha = 0.82 if drag_mode else 0.72
         self.smooth_x = alpha * next_x + (1.0 - alpha) * self.smooth_x
         self.smooth_y = alpha * next_y + (1.0 - alpha) * self.smooth_y
         self._move_cursor(self.smooth_x, self.smooth_y)
 
+    def _edge_push(self, control_pt: Tuple[float, float]) -> Tuple[float, float]:
+        """Adds continuous motion when the hand rests near a comfortable edge."""
+        edge_start = 0.64
+        edge_strength = 0.010
+        x, y = control_pt
+        push_x = 0.0
+        push_y = 0.0
+
+        if x > edge_start:
+            push_x = (x - edge_start) * edge_strength
+        elif x < 1.0 - edge_start:
+            push_x = (x - (1.0 - edge_start)) * edge_strength
+
+        if y > edge_start:
+            push_y = (y - edge_start) * edge_strength * 1.8
+        elif y < 1.0 - edge_start:
+            push_y = (y - (1.0 - edge_start)) * edge_strength * 1.4
+
+        return push_x, push_y
+
+    def _edge_scroll_steps(self, y: float) -> int:
+        """Scrolls continuously when two fingers rest near the upper/lower zone."""
+        lower_zone = 0.62
+        upper_zone = 0.38
+        scroll_speed = float(self.settings.get("scroll_speed"))
+        if y > lower_zone:
+            return int(np.clip(-(y - lower_zone) * 34.0 * scroll_speed, -7, -1))
+        if y < upper_zone:
+            return int(np.clip((upper_zone - y) * 28.0 * scroll_speed, 1, 7))
+        return 0
+
     def _finish_left_pinch(self, now: float, force_drag_release: bool = False) -> str:
         """Completes a left pinch as click or drag release."""
         action = GESTURE_MOVE
-        if self.left_drag_started or force_drag_release:
+        if self.is_dragging:
             self._release_drag_if_active()
             if self.left_drag_started:
                 action = GESTURE_DRAG
-        elif self.left_pinched and now - self.left_pinch_start_time <= 0.55:
+            elif self.left_pinched:
+                self.stats["clicks"] += 1
+                self.last_left_click_time = now
+                logger.info("System Action: Left Click")
+                action = GESTURE_LEFT_CLICK
+        elif self.left_drag_started or force_drag_release:
+            self._release_drag_if_active()
+            if self.left_drag_started:
+                action = GESTURE_DRAG
+        elif (
+            self.left_pinched
+            and now - self.left_pinch_start_time <= 0.55
+            and now - self.last_left_click_time > 0.35
+        ):
             self._trigger_left_click()
+            self.last_left_click_time = now
             action = GESTURE_LEFT_CLICK
 
         self.left_pinched = False
         self.left_drag_started = False
         return action
+
+    def _press_left_button(self) -> None:
+        """Holds the left mouse button down for click or drag."""
+        if self.is_dragging:
+            return
+
+        try:
+            self._send_mouse_input(MOUSEEVENTF_LEFTDOWN)
+        except Exception as e:
+            logger.error("System Action failed: Left Button Down: %s", e)
+            self.set_enabled(False)
+            return
+        self.is_dragging = True
 
     def _finish_right_pinch(self) -> None:
         """Clears right-pinch state."""
