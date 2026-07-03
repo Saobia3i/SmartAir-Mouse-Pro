@@ -45,11 +45,11 @@ GESTURE_LOCK = "LOCK"
 GESTURE_NONE = "NONE"
 
 GESTURE_DESCRIPTIONS = {
-    GESTURE_MOVE: "One finger: Move cursor",
-    GESTURE_LEFT_CLICK: "One finger double tap: Left Click",
-    GESTURE_RIGHT_CLICK: "Two finger tap: Right Click",
-    GESTURE_DRAG: "Index + Middle pinch: Drag",
-    GESTURE_SCROLL: "Two fingers up/down: Scroll",
+    GESTURE_MOVE: "One finger move: Cursor",
+    GESTURE_LEFT_CLICK: "Thumb + index quick pinch: Left Click",
+    GESTURE_RIGHT_CLICK: "Thumb + middle pinch: Right Click",
+    GESTURE_DRAG: "Thumb + index hold: Drag",
+    GESTURE_SCROLL: "Two fingers move up/down: Scroll",
     GESTURE_SCREENSHOT: "Three fingers: Screenshot",
     GESTURE_PAUSE: "Open Palm: Pause Tracking",
     GESTURE_LOCK: "Closed Fist: Lock Cursor",
@@ -59,8 +59,8 @@ GESTURE_DESCRIPTIONS = {
 # Settings Defaults
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "camera_index": 0,
-    "sensitivity_x": 1.5,
-    "sensitivity_y": 1.5,
+    "sensitivity_x": 0.8,
+    "sensitivity_y": 0.8,
     "smoothing_factor": 0.20,  # Kalman + EMA
     "trail_length": 15,
     "trail_color": "#00FFCC",  # Neon cyan

@@ -6,10 +6,12 @@ Implements exponential smoothing, Kalman Filter, dead zones, and adaptive sensit
 
 import logging
 import time
+import ctypes
 import numpy as np
 import pyautogui
 from pynput.mouse import Controller, Button
 from typing import Tuple, Dict, Any
+from ctypes import wintypes
 
 try:
     import win32api
@@ -31,6 +33,51 @@ logger = logging.getLogger(__name__)
 # Keep pyautogui's corner failsafe available as a last-resort escape hatch.
 pyautogui.PAUSE = 0.0
 pyautogui.FAILSAFE = True
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_ABSOLUTE = 0x8000
+ULONG_PTR = wintypes.WPARAM
+USER32 = ctypes.WinDLL("user32", use_last_error=True)
+
+
+class MouseInput(ctypes.Structure):
+    """Win32 MOUSEINPUT structure for SendInput."""
+
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class InputUnion(ctypes.Union):
+    """Win32 INPUT union."""
+
+    _fields_ = [("mi", MouseInput)]
+
+
+class Input(ctypes.Structure):
+    """Win32 INPUT structure."""
+
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", InputUnion),
+    ]
+
+
+USER32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int)
+USER32.SendInput.restype = wintypes.UINT
+USER32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+USER32.SetCursorPos.restype = wintypes.BOOL
 
 
 class KalmanFilter2D:
@@ -152,6 +199,13 @@ class MouseController:
         self.two_finger_tap = self._new_tap_state()
         self.last_one_finger_tap_time = 0.0
         self.last_stats_update = time.time()
+        self.last_touch_pt = None
+        self.last_scroll_y = None
+        self.left_pinched = False
+        self.right_pinched = False
+        self.left_pinch_start_time = 0.0
+        self.left_drag_started = False
+        self.right_click_fired = False
         
         # Session statistics (reset on app start)
         self.stats = {
@@ -161,6 +215,14 @@ class MouseController:
             "scroll_count": 0,
             "accuracy": 0.98  # Default tracking success confidence ratio
         }
+
+    def _send_mouse_input(self, flags: int, data: int = 0, x: int = 0, y: int = 0) -> None:
+        """Sends native Windows mouse input using SendInput."""
+        mouse_input = MouseInput(x, y, data, flags, 0, 0)
+        input_struct = Input(INPUT_MOUSE, InputUnion(mi=mouse_input))
+        sent = USER32.SendInput(1, ctypes.byref(input_struct), ctypes.sizeof(input_struct))
+        if sent != 1:
+            raise OSError(f"SendInput failed with error {ctypes.get_last_error()}")
 
     def reset_stats(self) -> None:
         """Resets tracked metrics."""
@@ -201,12 +263,171 @@ class MouseController:
         self.smooth_x, self.smooth_y = self._apply_filters(screen_x, screen_y)
         return int(self.smooth_x), int(self.smooth_y)
 
+    def reset_touch_state(self) -> None:
+        """Clears touchpad gesture state when tracking is interrupted."""
+        self.last_touch_pt = None
+        self.last_scroll_y = None
+        self.left_pinched = False
+        self.right_pinched = False
+        self.left_drag_started = False
+        self.right_click_fired = False
+        self._reset_tap_states()
+        self._release_drag_if_active()
+
+    def process_touchpad_action(self, landmarks: list) -> Tuple[int, int, str]:
+        """Runs a touchpad-like relative cursor and gesture model.
+
+        Rules:
+            One index finger moves the cursor relative to its previous position.
+            Thumb + index quick pinch/release performs left click.
+            Thumb + index hold performs drag until released.
+            Thumb + middle pinch performs right click.
+            Two fingers move vertically to scroll while the cursor stays put.
+
+        Args:
+            landmarks: Raw normalized landmarks list.
+
+        Returns:
+            Cursor x, cursor y, and detected action name.
+        """
+        if not self.enabled:
+            x, y = self.preview_cursor_position(landmarks)
+            return x, y, "PREVIEW"
+
+        now = time.time()
+        index_tip = landmarks[INDEX_FINGER_TIP]
+        middle_tip = landmarks[MIDDLE_FINGER_TIP]
+        control_pt = (index_tip[0], index_tip[1])
+
+        index_ext = landmarks[INDEX_FINGER_TIP][1] < landmarks[INDEX_FINGER_PIP][1]
+        middle_ext = landmarks[MIDDLE_FINGER_TIP][1] < landmarks[MIDDLE_FINGER_PIP][1]
+        ring_ext = landmarks[RING_FINGER_TIP][1] < landmarks[RING_FINGER_PIP][1]
+        pinky_ext = landmarks[PINKY_TIP][1] < landmarks[PINKY_PIP][1]
+
+        hand_scale = max(
+            self._distance(landmarks[WRIST], landmarks[MIDDLE_FINGER_MCP]),
+            0.001
+        )
+        pinch_threshold = max(float(self.settings.get("click_threshold")), hand_scale * 0.28)
+        left_pinched = self._distance(landmarks[THUMB_TIP], landmarks[INDEX_FINGER_TIP]) < pinch_threshold
+        right_pinched = self._distance(landmarks[THUMB_TIP], landmarks[MIDDLE_FINGER_TIP]) < pinch_threshold
+        two_finger_scroll = index_ext and middle_ext and not ring_ext and not pinky_ext and not left_pinched and not right_pinched
+
+        action = GESTURE_MOVE
+        if index_ext and middle_ext and ring_ext and not pinky_ext:
+            self.last_touch_pt = control_pt
+            self.last_scroll_y = None
+            return int(self.smooth_x), int(self.smooth_y), GESTURE_SCREENSHOT
+
+        if two_finger_scroll:
+            avg_y = (index_tip[1] + middle_tip[1]) / 2.0
+            if self.last_scroll_y is None:
+                self.last_scroll_y = avg_y
+            else:
+                dy = avg_y - self.last_scroll_y
+                if abs(dy) > 0.006:
+                    scroll_speed = float(self.settings.get("scroll_speed"))
+                    scroll_amount = int(np.clip(-dy * 900.0 * scroll_speed, -10, 10))
+                    if scroll_amount != 0:
+                        self._send_scroll_steps(scroll_amount)
+                        self.last_scroll_y = avg_y
+                action = GESTURE_SCROLL
+            self.last_touch_pt = control_pt
+            self._finish_left_pinch(now, force_drag_release=True)
+            self._finish_right_pinch()
+            return int(self.smooth_x), int(self.smooth_y), action
+
+        self.last_scroll_y = None
+        self._move_touchpad_cursor(control_pt)
+
+        if right_pinched and not self.right_pinched:
+            self.right_pinched = True
+            self.right_click_fired = True
+            self._finish_left_pinch(now, force_drag_release=True)
+            self._trigger_right_click()
+            action = GESTURE_RIGHT_CLICK
+        elif not right_pinched and self.right_pinched:
+            self._finish_right_pinch()
+
+        if left_pinched and not self.left_pinched and not right_pinched:
+            self.left_pinched = True
+            self.left_pinch_start_time = now
+            self.left_drag_started = False
+            action = GESTURE_LEFT_CLICK
+        elif left_pinched and self.left_pinched and not right_pinched:
+            if not self.left_drag_started and now - self.left_pinch_start_time > 0.35:
+                self.left_drag_started = True
+                self._trigger_drag(self.smooth_x, self.smooth_y)
+            elif self.left_drag_started:
+                self._trigger_drag(self.smooth_x, self.smooth_y)
+            action = GESTURE_DRAG if self.left_drag_started else GESTURE_LEFT_CLICK
+        elif not left_pinched and self.left_pinched:
+            action = self._finish_left_pinch(now)
+
+        return int(self.smooth_x), int(self.smooth_y), action
+
+    def _move_touchpad_cursor(self, control_pt: Tuple[float, float]) -> None:
+        """Moves the cursor using relative finger deltas like a laptop touchpad."""
+        if self.last_touch_pt is None:
+            self.last_touch_pt = control_pt
+            return
+
+        dx_norm = control_pt[0] - self.last_touch_pt[0]
+        dy_norm = control_pt[1] - self.last_touch_pt[1]
+        self.last_touch_pt = control_pt
+
+        dead_zone = 0.0025
+        if abs(dx_norm) < dead_zone and abs(dy_norm) < dead_zone:
+            return
+
+        sensitivity_x = float(self.settings.get("sensitivity_x")) * 0.32
+        sensitivity_y = float(self.settings.get("sensitivity_y")) * 0.32
+        dx = float(np.clip(dx_norm * self.screen_w * sensitivity_x, -32.0, 32.0))
+        dy = float(np.clip(dy_norm * self.screen_h * sensitivity_y, -32.0, 32.0))
+
+        next_x = float(np.clip(self.smooth_x + dx, 0.0, self.screen_w - 1.0))
+        next_y = float(np.clip(self.smooth_y + dy, 0.0, self.screen_h - 1.0))
+        alpha = max(0.25, min(float(self.settings.get("smoothing_factor")) + 0.25, 0.65))
+        self.smooth_x = alpha * next_x + (1.0 - alpha) * self.smooth_x
+        self.smooth_y = alpha * next_y + (1.0 - alpha) * self.smooth_y
+        self._move_cursor(self.smooth_x, self.smooth_y)
+
+    def _finish_left_pinch(self, now: float, force_drag_release: bool = False) -> str:
+        """Completes a left pinch as click or drag release."""
+        action = GESTURE_MOVE
+        if self.left_drag_started or force_drag_release:
+            self._release_drag_if_active()
+            if self.left_drag_started:
+                action = GESTURE_DRAG
+        elif self.left_pinched and now - self.left_pinch_start_time <= 0.55:
+            self._trigger_left_click()
+            action = GESTURE_LEFT_CLICK
+
+        self.left_pinched = False
+        self.left_drag_started = False
+        return action
+
+    def _finish_right_pinch(self) -> None:
+        """Clears right-pinch state."""
+        self.right_pinched = False
+        self.right_click_fired = False
+
+    def _send_scroll_steps(self, scroll_amount: int) -> None:
+        """Sends vertical wheel movement in notches."""
+        try:
+            self._send_mouse_input(MOUSEEVENTF_WHEEL, int(scroll_amount) * 120)
+        except Exception as e:
+            logger.error("System Action failed: Scroll: %s", e)
+            self.set_enabled(False)
+            return
+        self.stats["scroll_count"] += abs(scroll_amount)
+
     def process_simple_hand_action(self, landmarks: list) -> Tuple[int, int, str]:
         """Runs a simple, reliable gesture map directly from landmarks.
 
         Rules:
             Index tip controls cursor.
-            One-finger double tap triggers left click.
+            Thumb + index pinch triggers left click.
             Two-finger tap triggers right click.
             Two-finger hold and vertical movement scrolls.
             Three fingers trigger screenshot.
@@ -228,11 +449,21 @@ class MouseController:
         middle_ext = landmarks[MIDDLE_FINGER_TIP][1] < landmarks[MIDDLE_FINGER_PIP][1]
         ring_ext = landmarks[RING_FINGER_TIP][1] < landmarks[RING_FINGER_PIP][1]
         pinky_ext = landmarks[PINKY_TIP][1] < landmarks[PINKY_PIP][1]
+        hand_scale = max(
+            self._distance(landmarks[WRIST], landmarks[MIDDLE_FINGER_MCP]),
+            0.001
+        )
+        pinch_threshold = max(float(self.settings.get("click_threshold")), hand_scale * 0.30)
+        thumb_index_distance = self._distance(landmarks[THUMB_TIP], landmarks[INDEX_FINGER_TIP])
+        left_pinched = thumb_index_distance < pinch_threshold
 
         action = GESTURE_MOVE
         now = time.time()
         if index_ext and middle_ext and ring_ext and not pinky_ext:
             action = GESTURE_SCREENSHOT
+            self._reset_tap_states()
+        elif left_pinched:
+            action = GESTURE_LEFT_CLICK
             self._reset_tap_states()
         elif index_ext and middle_ext and not ring_ext:
             self.one_finger_tap = self._new_tap_state()
@@ -243,13 +474,6 @@ class MouseController:
                 action = GESTURE_SCROLL
         elif index_ext and not middle_ext:
             self.two_finger_tap = self._new_tap_state()
-            if self._detect_tap(self.one_finger_tap, landmarks[INDEX_FINGER_TIP][1], now):
-                if now - self.last_one_finger_tap_time <= 0.75:
-                    action = GESTURE_LEFT_CLICK
-                    self.last_one_finger_tap_time = 0.0
-                else:
-                    action = "TAP 1/2"
-                    self.last_one_finger_tap_time = now
         else:
             self._reset_tap_states()
 
@@ -485,10 +709,8 @@ class MouseController:
         self.stats["distance_moved"] += dist
         
         try:
-            if win32api is not None:
-                win32api.SetCursorPos((int(x), int(y)))
-            else:
-                pyautogui.moveTo(int(x), int(y), duration=0)
+            if not USER32.SetCursorPos(int(x), int(y)):
+                raise OSError(f"SetCursorPos failed with error {ctypes.get_last_error()}")
         except Exception as e:
             logger.error("System Action failed: Move Cursor: %s", e)
             self.set_enabled(False)
@@ -498,11 +720,8 @@ class MouseController:
     def _trigger_left_click(self) -> None:
         """Performs left click action."""
         try:
-            if win32api is not None and win32con is not None:
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-            else:
-                pyautogui.click(button="left")
+            self._send_mouse_input(MOUSEEVENTF_LEFTDOWN)
+            self._send_mouse_input(MOUSEEVENTF_LEFTUP)
         except Exception as e:
             logger.error("System Action failed: Left Click: %s", e)
             self.set_enabled(False)
@@ -515,11 +734,8 @@ class MouseController:
     def _trigger_right_click(self) -> None:
         """Performs right click action."""
         try:
-            if win32api is not None and win32con is not None:
-                win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-                win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-            else:
-                pyautogui.click(button="right")
+            self._send_mouse_input(MOUSEEVENTF_RIGHTDOWN)
+            self._send_mouse_input(MOUSEEVENTF_RIGHTUP)
         except Exception as e:
             logger.error("System Action failed: Right Click: %s", e)
             self.set_enabled(False)
@@ -537,10 +753,7 @@ class MouseController:
         """
         if not self.is_dragging:
             try:
-                if win32api is not None and win32con is not None:
-                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                else:
-                    pyautogui.mouseDown(button="left")
+                self._send_mouse_input(MOUSEEVENTF_LEFTDOWN)
             except Exception as e:
                 logger.error("System Action failed: Drag Hold: %s", e)
                 self.set_enabled(False)
@@ -554,10 +767,7 @@ class MouseController:
         """Releases the left click if currently dragging."""
         if self.is_dragging:
             try:
-                if win32api is not None and win32con is not None:
-                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-                else:
-                    pyautogui.mouseUp(button="left")
+                self._send_mouse_input(MOUSEEVENTF_LEFTUP)
             except Exception as e:
                 logger.error("System Action failed: Drag Release: %s", e)
             self.is_dragging = False
@@ -584,10 +794,7 @@ class MouseController:
             scroll_amount = int(np.sign(dy) * -5 * scroll_speed)
             if scroll_amount != 0:
                 try:
-                    if win32api is not None and win32con is not None:
-                        win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, scroll_amount * 120, 0)
-                    else:
-                        pyautogui.scroll(scroll_amount)
+                    self._send_mouse_input(MOUSEEVENTF_WHEEL, scroll_amount * 120)
                 except Exception as e:
                     logger.error("System Action failed: Scroll: %s", e)
                     self.set_enabled(False)

@@ -221,6 +221,18 @@ class SmartAirMouseApp(ctk.CTk):
             command=lambda: self._set_mouse_control(self.mouse_control_switch.get() == 1)
         )
         self.mouse_control_switch.pack(pady=10, anchor=tk.W, padx=15)
+
+        self.sidebar_test_click_btn = ctk.CTkButton(
+            self.scroll_frame,
+            text="Test Click",
+            fg_color="#333333",
+            hover_color="#444444",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            height=34,
+            command=self._test_left_click
+        )
+        self.sidebar_test_click_btn.pack(fill=tk.X, padx=15, pady=(4, 12))
         
         # ==========================================
         # RIGHT PANEL: STATS, PREVIEW & BUTTONS
@@ -351,6 +363,7 @@ class SmartAirMouseApp(ctk.CTk):
             width=90, height=40, command=self._test_left_click
         )
         self.test_click_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.test_click_count = 0
 
     # ==========================================
     # SETTINGS ELEMENT BUILDERS
@@ -544,9 +557,6 @@ class SmartAirMouseApp(ctk.CTk):
         self.tracking_thread = threading.Thread(target=self._tracking_loop, daemon=True)
         self.tracking_thread.start()
         
-        if self.overlay:
-            self.overlay.show()
-            
         logger.info("Tracking thread started.")
 
     def stop_tracking(self) -> None:
@@ -609,6 +619,9 @@ class SmartAirMouseApp(ctk.CTk):
 
     def _test_left_click(self) -> None:
         """Runs a direct OS click test at the current cursor location."""
+        self.test_click_count += 1
+        self.test_click_btn.configure(text=f"Tested {self.test_click_count}")
+        self.sidebar_test_click_btn.configure(text=f"Tested {self.test_click_count}")
         self.mouse_controller._trigger_left_click()
 
     def open_calibration(self) -> None:
@@ -666,7 +679,7 @@ class SmartAirMouseApp(ctk.CTk):
                         self.effects.set_gesture_label("CALIBRATING")
                     else:
                         if self.mouse_control_enabled:
-                            cursor_x, cursor_y, gesture = self.mouse_controller.process_simple_hand_action(landmarks)
+                            cursor_x, cursor_y, gesture = self.mouse_controller.process_touchpad_action(landmarks)
                         else:
                             cursor_x, cursor_y = self.mouse_controller.preview_cursor_position(landmarks)
                             gesture = "PREVIEW"
@@ -680,6 +693,7 @@ class SmartAirMouseApp(ctk.CTk):
                             self.last_simple_screenshot_time = time.time()
                             self._trigger_screenshot()
                 else:
+                    self.mouse_controller.reset_touch_state()
                     self.effects.set_gesture_label("NO HAND")
 
                 # Update overlay statistical FPS
